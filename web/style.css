@@ -94,6 +94,27 @@ html, body {
   background: #fff;
 }
 
+/* 二级入口：默认只露一个按钮，点了才展开（低频功能） */
+.menu-wrap { position: relative; display: inline-flex; }
+.menu {
+  position: absolute;
+  top: calc(100% + 5px);
+  left: 0;
+  z-index: 60;
+  min-width: 160px;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  background: #fff;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(32, 33, 36, 0.16);
+}
+.menu .btn,
+.menu .btn.check { justify-content: flex-start; text-align: left; }
+.menu-sep { height: 1px; background: var(--border); margin: 3px 0; }
+
 .sep { width: 1px; height: 20px; background: var(--border); margin: 0 4px; }
 .spacer { flex: 1 1 auto; }
 

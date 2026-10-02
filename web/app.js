@@ -77,6 +77,7 @@ function invalidate() {
   cellCache.clear();
   dataVersion++;
   textFlagKey = '';
+  scheduleSave();
 }
 
 function selRange() {
@@ -292,7 +293,7 @@ function clearFlashes() {
 }
 
 function touchesArea(a, b) {
-  return a.r1 <= b.r2 + 1 && b.r1 <= a.r2 + 1 && a.c1 <= b.c2 + 1 && b.c1 <= a.c2 + 1;
+  return a.sheet === b.sheet && a.r1 <= b.r2 + 1 && b.r1 <= a.r2 + 1 && a.c1 <= b.c2 + 1 && b.c1 <= a.c2 + 1;
 }
 
 /** 把重叠/相邻的区域并成尽量少的矩形 */
@@ -352,36 +353,132 @@ function flashAreas(areas, ms = FLASH_MS) {
 
 /** 从沙箱的 ops 推断这次改到的区域（args 已被 brief，只取前面的范围参数） */
 function opArea(op) {
-  const name = op?.name;
-  const args = op?.args || [];
+  return opAreasRaw(op?.name, op?.args || [])[0] || null;
+}
+
+/**
+ * 与 opArea 同源，但吃「原始参数」（沙箱 onOp 回调给的是未 brief 的值），
+ * 因此能拿到 setRange 二维数组的真实尺寸；也修了跨表引用（Sheet2!A1）。
+ * 返回这次调用涉及的区域数组（读方法返回空）。
+ */
+function opAreasRaw(name, args = []) {
   const asRef = typeof args[0] === 'string' ? parseRef(args[0]) : null;
   const n = (i) => (typeof args[i] === 'number' ? args[i] : null);
-  const box = (r1, c1, r2, c2) => ({ sheet, r1, c1, r2, c2 });
+  const box = (r1, c1, r2, c2, sh = asRef ? asRef.sheet : sheet) => ({ sheet: sh, r1, c1, r2, c2 });
 
   if (name === 'setCell') {
-    if (asRef) return box(asRef.r1, asRef.c1, asRef.r1, asRef.c1);
-    if (n(0) != null && n(1) != null) return box(args[0], args[1], args[0], args[1]);
-    return null;
+    if (asRef) return [box(asRef.r1, asRef.c1, asRef.r1, asRef.c1)];
+    if (n(0) != null && n(1) != null) return [box(args[0], args[1], args[0], args[1])];
+    return [];
   }
-  if (name === 'setRange' || name === 'clearRange' || name === 'applyStyle'
-      || name === 'format' || name === 'merge' || name === 'unmerge') {
-    if (asRef) return box(asRef.r1, asRef.c1, asRef.r2, asRef.c2);
+  if (name === 'setRange') {
+    const values = args[args.length - 1];
+    let r1, c1, rMax, cMax;
+    if (asRef) { r1 = asRef.r1; c1 = asRef.c1; rMax = asRef.r2; cMax = asRef.c2; }
+    else if (n(0) != null && n(1) != null) { r1 = n(0); c1 = n(1); rMax = n(2) ?? r1; cMax = n(3) ?? c1; }
+    else return [];
+    const grid = Array.isArray(values) && Array.isArray(values[0]) ? values : [values];
+    const rows = Math.max(1, grid.length);
+    const cols = Math.max(1, ...grid.map((row) => (Array.isArray(row) ? row.length : 1)));
+    return [box(r1, c1, Math.min(r1 + rows - 1, rMax), Math.min(c1 + cols - 1, cMax))];
+  }
+  if (name === 'clearRange' || name === 'applyStyle' || name === 'format'
+      || name === 'merge' || name === 'unmerge') {
+    if (asRef) return [box(asRef.r1, asRef.c1, asRef.r2, asRef.c2)];
     if (n(0) != null && n(1) != null && n(2) != null && n(3) != null) {
-      return box(args[0], args[1], args[2], args[3]);
+      return [box(n(0), n(1), n(2), n(3))];
     }
-    return null;
+    return [];
   }
   if (name === 'insertRows' || name === 'deleteRows') {
-    if (n(0) == null) return null;
+    if (n(0) == null) return [];
     const u = usedRangeOf(sheet);
-    return box(args[0], u ? u.c1 : 1, args[0] + (n(1) || 1) - 1, u ? u.c2 : 12);
+    return [box(args[0], u ? u.c1 : 1, args[0] + (n(1) || 1) - 1, u ? u.c2 : 12)];
   }
   if (name === 'insertColumns' || name === 'deleteColumns') {
-    if (n(0) == null) return null;
+    if (n(0) == null) return [];
     const u = usedRangeOf(sheet);
-    return box(u ? u.r1 : 1, args[0], u ? u.r2 : GRID_ROWS, args[0] + (n(1) || 1) - 1);
+    return [box(u ? u.r1 : 1, args[0], u ? u.r2 : GRID_ROWS, args[0] + (n(1) || 1) - 1)];
   }
-  return null;
+  return [];
+}
+
+function sheetPrefixedRef(sh, r, c) {
+  const base = a1(r, c);
+  if (sh === sheet) return base;
+  let name = '';
+  try { name = model.getWorksheetsProperties()[sh]?.name || ''; } catch { /* ignore */ }
+  return name ? `${name}!${base}` : base;
+}
+
+function cellSnapshot(sh, r, c) {
+  let content = '', value = '';
+  try { content = model.getCellContent(sh, r, c); } catch { /* ignore */ }
+  try { value = model.getFormattedCellValue(sh, r, c); } catch { /* ignore */ }
+  return { sheet: sh, r, c, ref: sheetPrefixedRef(sh, r, c), content, value };
+}
+
+function readAreaCells(areas, cap = 300) {
+  const out = [];
+  for (const a of areas || []) {
+    for (let r = a.r1; r <= a.r2; r++) {
+      for (let c = a.c1; c <= a.c2; c++) {
+        if (out.length >= cap) return out;
+        out.push(cellSnapshot(a.sheet, r, c));
+      }
+    }
+  }
+  return out;
+}
+
+function pickDisplay(cell) {
+  const v = cell.value === null || cell.value === undefined ? '' : String(cell.value);
+  if (v !== '') return v;
+  return cell.content === null || cell.content === undefined ? '' : String(cell.content);
+}
+
+/**
+ * 记录一次 AI 执行前后的单元格差异。沙箱每调用一个 IC 写方法前 record(name, args)
+ * 抓一次 before（此时还没写），执行完 finish() 对比现在，产出：
+ *   { areas: [{sheet,r1,c1,r2,c2}], diff: [{ref,before,after}], truncated, moreChanges }
+ * areas 同时用于「重新高亮」重放动画。
+ */
+function makeDiffRecorder(cap = 300) {
+  const before = new Map();
+  const areas = [];
+  const seen = new Set();
+  let truncated = false;
+  let moreChanges = false;
+
+  const record = (name, args) => {
+    let list = [];
+    try { list = opAreasRaw(name, args || []); } catch { return; }
+    for (const a of list) {
+      const k = `${a.sheet}:${a.r1}:${a.c1}:${a.r2}:${a.c2}`;
+      if (!seen.has(k)) { seen.add(k); areas.push(a); }
+      if (truncated) continue;
+      const room = cap - before.size;
+      if (room <= 0) { truncated = true; continue; }
+      for (const cell of readAreaCells([a], room)) {
+        const ck = `${cell.sheet}:${cell.r}:${cell.c}`;
+        if (!before.has(ck)) before.set(ck, cell);
+        if (before.size >= cap) { truncated = true; break; }
+      }
+    }
+  };
+
+  const finish = () => {
+    const diff = [];
+    for (const cell of before.values()) {
+      const now = cellSnapshot(cell.sheet, cell.r, cell.c);
+      if (cell.content === now.content && cell.value === now.value) continue;
+      if (diff.length >= 12) { moreChanges = true; break; }
+      diff.push({ ref: cell.ref, before: pickDisplay(cell), after: pickDisplay(now) });
+    }
+    return { areas, diff, truncated, moreChanges };
+  };
+
+  return { record, finish };
 }
 
 // ---------------- 格式工具栏（粗/斜/下划线/删除线/字号） ----------------
@@ -694,7 +791,7 @@ function renderTabs() {
     b.ondblclick = () => {
       const name = prompt('重命名工作表', p.name);
       if (name && name !== p.name) {
-        try { model.renameSheet(i, name); renderTabs(); } catch (e) { toast(e, 'error'); }
+        try { model.renameSheet(i, name); renderTabs(); scheduleSave(); } catch (e) { toast(e, 'error'); }
       }
     };
     tabList.appendChild(b);
@@ -1158,8 +1255,24 @@ $('btn-italic').onclick = () => toggleFontFlag('i');
 $('btn-underline').onclick = () => toggleFontFlag('u');
 $('btn-strike').onclick = () => toggleFontFlag('strike');
 $('font-size').onchange = (ev) => setFontSize(ev.target.value);
-// 文本单元格高亮 / 转数字
-$('chk-text').onchange = () => { textFlagKey = ''; textFlagRenderedKey = ''; render(); };
+// 文本单元格高亮 / 转数字（低频，收进一个二级按钮里）
+const textMenu = $('text-tools-menu');
+function syncTextTools() {
+  const open = !textMenu.classList.contains('hidden');
+  $('btn-text-tools').classList.toggle('on', open || $('chk-text').checked);
+}
+$('btn-text-tools').onclick = (ev) => {
+  ev.stopPropagation();
+  textMenu.classList.toggle('hidden');
+  syncTextTools();
+};
+document.addEventListener('click', (ev) => {
+  if (!textMenu.classList.contains('hidden') && !ev.target.closest('#text-tools')) {
+    textMenu.classList.add('hidden');
+    syncTextTools();
+  }
+});
+$('chk-text').onchange = () => { textFlagKey = ''; textFlagRenderedKey = ''; render(); syncTextTools(); };
 $('chk-text-num').onchange = () => { textFlagKey = ''; textFlagRenderedKey = ''; render(); };
 $('btn-numify').onclick = () => numify('selection');
 $('btn-numify-all').onclick = () => numify('all');
@@ -1180,6 +1293,111 @@ function updateUndoButtons() {
     $('btn-redo').disabled = !model.canRedo();
   } catch { /* ignore */ }
 }
+
+// ---------------------------------------------------------------- 本地兜底保存
+// 刷新/误关页面后数据不丢：把工作簿导出成 xlsx，按「文件名」存进 localStorage。
+// 多开 tab 处理不同文件时，每个 tab 用 sessionStorage 记住自己当前的文件名（刷新后恢复自己那个）；
+// 新开 tab 没有指针时，回退到最近一次保存的文件。
+const LS_WB_PREFIX = 'ironcalc.wb.v1.';
+const LS_WB_INDEX = 'ironcalc.wb.index.v1';
+const SS_WB_CURRENT = 'ironcalc.wb.current.v1';
+const WB_SAVE_MAX_BYTES = 4_500_000; // localStorage 约 5MB（UTF-16），留点余量
+const WB_KEEP = 12;
+let saveTimer = null;
+let saveDirty = false;
+let saveWarned = false;
+
+function wbKey(name) { return LS_WB_PREFIX + (name || 'Workbook'); }
+
+function bytesToBase64(bytes) {
+  let bin = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  }
+  return btoa(bin);
+}
+
+function base64ToBytes(b64) {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+/** 每次数据变动后调用（已去抖）：过一会儿把当前工作簿存到本地。 */
+function scheduleSave() {
+  saveDirty = true;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(saveWorkbookNow, 1000);
+}
+
+function markCurrentName() {
+  if (!model) return;
+  try { sessionStorage.setItem(SS_WB_CURRENT, model.getName() || 'Workbook'); } catch { /* ignore */ }
+}
+
+function pruneSaved(keep) {
+  try {
+    let list = JSON.parse(localStorage.getItem(LS_WB_INDEX) || '[]');
+    if (!Array.isArray(list)) list = [];
+    list = list.filter((n) => n !== keep);
+    list.unshift(keep);
+    for (const old of list.slice(WB_KEEP)) { try { localStorage.removeItem(wbKey(old)); } catch { /* ignore */ } }
+    localStorage.setItem(LS_WB_INDEX, JSON.stringify(list.slice(0, WB_KEEP)));
+  } catch { /* ignore */ }
+}
+
+function saveWorkbookNow() {
+  clearTimeout(saveTimer);
+  saveTimer = null;
+  if (!model || !saveDirty) return;
+  const name = model.getName() || 'Workbook';
+  try {
+    const bytes = model.toXlsx();
+    if (bytes.length > WB_SAVE_MAX_BYTES) {
+      if (!saveWarned) { saveWarned = true; toast('表格太大，已停止本地自动保存（请用「保存」导出）', 'error'); }
+      saveDirty = false;
+      return;
+    }
+    localStorage.setItem(wbKey(name), JSON.stringify({ name, at: Date.now(), data: bytesToBase64(bytes) }));
+    try { sessionStorage.setItem(SS_WB_CURRENT, name); } catch { /* ignore */ }
+    pruneSaved(name);
+    saveDirty = false;
+  } catch (e) {
+    if (!saveWarned) { saveWarned = true; toast('本地自动保存失败：' + (e?.message || e), 'error'); }
+    console.warn('[WB] 本地保存失败', e);
+  }
+}
+
+/** 启动时尝试恢复：优先本 tab 上次打开的文件，其次最近保存的文件。 */
+function restoreWorkbook() {
+  let name = null;
+  try { name = sessionStorage.getItem(SS_WB_CURRENT); } catch { /* ignore */ }
+  if (!name) {
+    try {
+      const list = JSON.parse(localStorage.getItem(LS_WB_INDEX) || '[]');
+      if (Array.isArray(list) && list.length) name = list[0];
+    } catch { /* ignore */ }
+  }
+  if (!name) return false;
+  try {
+    const raw = localStorage.getItem(wbKey(name));
+    if (!raw) return false;
+    const rec = JSON.parse(raw);
+    if (!rec?.data) return false;
+    const m = Model.fromXlsx(base64ToBytes(rec.data), rec.name || name, LOCALE, TIMEZONE, LANGUAGE);
+    replaceModel(m);
+    toast(`已恢复上次的《${m.getName()}》`);
+    return true;
+  } catch (e) {
+    console.warn('[WB] 恢复失败', e);
+    return false;
+  }
+}
+
+// 关页面/切后台时把没来得及去抖保存的内容立即落盘
+window.addEventListener('pagehide', () => { if (saveDirty) saveWorkbookNow(); });
 
 // ---------------------------------------------------------------- file IO
 $('file-input').addEventListener('change', async (ev) => {
@@ -1246,6 +1464,7 @@ function replaceModel(m) {
   sheet = 0;
   pick = null;
   clearFlashes();
+  markCurrentName();
   invalidate();
   cellPool.forEach((el) => el.remove());
   cellPool = [];
@@ -1286,7 +1505,7 @@ function seedDemo(m) {
 // ---------------------------------------------------------------- boot
 async function boot() {
   await init();
-  newWorkbook(true);
+  if (!restoreWorkbook()) newWorkbook(true);
   focusGrid();
   initAiPanel(IC);
   console.log('[IronCalc] ready');
@@ -1406,6 +1625,10 @@ const IC = {
     }
     return flashAreas(areas);
   },
+  // 直接高亮一组区域（AI 面板「重新高亮」重放用）
+  highlightAreas(areas) { return flashAreas(areas || []); },
+  // 记录执行前后差异：record(name, rawArgs) 在每次写方法前调用，finish() 取 diff
+  diffRecorder: (cap) => makeDiffRecorder(cap),
   a1,
   parseRef,
 
@@ -1544,6 +1767,7 @@ const IC = {
     const i = sheetIndex(nameOrIndex);
     model.renameSheet(i, String(newName));
     renderTabs();
+    scheduleSave();
     return true;
   },
   deleteSheet(nameOrIndex) {
@@ -1563,7 +1787,17 @@ const IC = {
   toXlsx: () => model.toXlsx(),
   fromXlsx: (bytes, name) => { replaceModel(Model.fromXlsx(bytes, name || 'Workbook', LOCALE, TIMEZONE, LANGUAGE)); return true; },
   getName: () => model.getName(),
-  setName: (n) => { model.setName(String(n)); wbNameEl.textContent = model.getName(); return model.getName(); },
+  setName: (n) => {
+    const old = model.getName();
+    model.setName(String(n));
+    wbNameEl.textContent = model.getName();
+    const next = model.getName() || 'Workbook';
+    if (old && old !== next) { try { localStorage.removeItem(wbKey(old)); } catch { /* ignore */ } }
+    markCurrentName();
+    saveDirty = true;
+    saveWorkbookNow();
+    return next;
+  },
   download: () => saveXlsx(),
 };
 

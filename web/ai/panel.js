@@ -100,7 +100,11 @@ export function initAiPanel(IC) {
           ttftMs: m.ttftMs,
           at: m.at,
           runs: m.runs
-            ? Object.fromEntries(Object.entries(m.runs).map(([k, v]) => [k, { status: v.status, text: v.text, at: v.at, wrote: v.wrote, seq: v.seq }]))
+            ? Object.fromEntries(Object.entries(m.runs).map(([k, v]) => [k, {
+              status: v.status, text: v.text, at: v.at, wrote: v.wrote, seq: v.seq,
+              diff: v.diff, areas: v.areas ? v.areas.slice(0, 80) : undefined,
+              moreChanges: v.moreChanges, truncated: v.truncated,
+            }]))
             : undefined,
           logs: m.logs ? m.logs.slice(0, 5) : undefined,
         })),
@@ -171,6 +175,13 @@ export function initAiPanel(IC) {
   function shortNum(n) {
     if (n === null || n === undefined) return '?';
     return n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n);
+  }
+
+  /** diff 里单元格值的短展示（空值/太长做处理）。 */
+  function diffText(v) {
+    const s = v === null || v === undefined ? '' : String(v);
+    if (s === '') return '（空）';
+    return s.length > 42 ? s.slice(0, 42) + '…' : s;
   }
 
   /** 一条消息底部的「首字延迟 · token」元信息。 */
@@ -250,6 +261,61 @@ export function initAiPanel(IC) {
       bubble.appendChild(box);
     }
 
+    // 每个执行过的代码块：底部留一份「变更 diff」+ 可重放高亮
+    const runList = Object.entries(runs).sort((a, b) => Number(a[0]) - Number(b[0]));
+    for (const [i, r] of runList) {
+      const hasDiff = Array.isArray(r.diff) && r.diff.length > 0;
+      const hasAreas = Array.isArray(r.areas) && r.areas.length > 0;
+      if (!hasDiff && !hasAreas) continue;
+      const d = document.createElement('div');
+      d.className = 'ai-diff';
+
+      const head = document.createElement('div');
+      head.className = 'ai-diff-head';
+      const title = document.createElement('span');
+      title.textContent = runList.length > 1 ? `第 ${Number(i) + 1} 段变更` : '变更';
+      head.appendChild(title);
+      if (hasAreas) {
+        const rb = document.createElement('button');
+        rb.className = 'btn tiny ai-replay';
+        rb.dataset.flash = i;
+        rb.title = '再放一次这次改动的区域高亮动画';
+        rb.textContent = '重新高亮';
+        head.appendChild(rb);
+      }
+      d.appendChild(head);
+
+      if (hasDiff) {
+        for (const ch of r.diff) {
+          const line = document.createElement('div');
+          line.className = 'ai-diff-line';
+          const ref = document.createElement('span');
+          ref.className = 'ai-diff-ref';
+          ref.textContent = ch.ref;
+          const before = document.createElement('span');
+          before.className = 'ai-diff-before';
+          before.textContent = diffText(ch.before);
+          const after = document.createElement('span');
+          after.className = 'ai-diff-after';
+          after.textContent = diffText(ch.after);
+          line.append(ref, before, document.createTextNode(' → '), after);
+          d.appendChild(line);
+        }
+        if (r.moreChanges || r.truncated) {
+          const more = document.createElement('div');
+          more.className = 'ai-diff-more';
+          more.textContent = r.moreChanges ? '…还有更多改动未列出' : '…单元格太多，只对比了前一部分';
+          d.appendChild(more);
+        }
+      } else {
+        const line = document.createElement('div');
+        line.className = 'ai-diff-line muted';
+        line.textContent = '本次是样式/结构改动，没有单元格值变化';
+        d.appendChild(line);
+      }
+      bubble.appendChild(d);
+    }
+
     const meta = usageText(m);
     if (meta) {
       const d = document.createElement('div');
@@ -271,14 +337,18 @@ export function initAiPanel(IC) {
   function updateStreamingBubble(index) {
     const wrap = $('ai-messages').querySelector(`.ai-msg[data-msg="${index}"]`);
     if (!wrap) return;
-    wrap.classList.add('streaming');
     const m = currentSession().messages[index];
+    if (!m) return; // 会话中途被切走/删除
+    wrap.classList.add('streaming');
     const old = wrap.querySelector('.ai-bubble');
     const next = buildBubble(m, { streaming: true });
     if (old) wrap.replaceChild(next, old);
     else wrap.appendChild(next);
     const box = $('ai-messages');
     box.scrollTop = box.scrollHeight;
+    // 思考过程自己有 max-height 内部滚动，也得跟着滚到底，否则一直卡在最上面
+    const think = wrap.querySelector('.ai-think-body');
+    if (think) think.scrollTop = think.scrollHeight;
   }
 
   // ------------------------------------------------------------ running code
@@ -300,14 +370,20 @@ export function initAiPanel(IC) {
 
     m.runs = m.runs || {};
     setStatus('执行中…');
+    // 边执行边记「写之前」的单元格值，跑完对比出现在，产出 diff + 涉及区域
+    const rec = IC.diffRecorder ? IC.diffRecorder() : null;
     let res;
     try {
-      res = await runAiCode(block.code, IC, { whitelist: IC_WHITELIST });
+      res = await runAiCode(block.code, IC, {
+        whitelist: IC_WHITELIST,
+        onOp: (name, args) => { try { rec?.record(name, args); } catch { /* ignore */ } },
+      });
     } catch (e) {
       res = { ok: false, error: { message: String(e?.message || e) }, ops: [], logs: [], ms: 0 };
     }
+    const captured = rec ? rec.finish() : { areas: [], diff: [], truncated: false, moreChanges: false };
     // 纯视觉高亮这次真正动过的区域（失败前已执行的也算），不会修改单元格样式
-    try { IC.highlightOps?.(res.ops || []); } catch { /* ignore */ }
+    try { IC.highlightAreas?.(captured.areas); } catch { /* ignore */ }
     if (res.ok) {
       const what = summarizeOps(res.ops) || '没有调用 IC（纯计算？）';
       let text = `✅ 已执行：${what}（${Math.round(res.ms)}ms）`;
@@ -315,12 +391,17 @@ export function initAiPanel(IC) {
         text += ` · 返回 ${JSON.stringify(res.result)}`;
       }
       const wrote = (res.ops || []).some((op) => IC_WRITE_METHODS.includes(op.name));
-      m.runs[blockIndex] = { status: 'ok', text, at: Date.now(), wrote, seq: state.undoSeq };
+      m.runs[blockIndex] = {
+        status: 'ok', text, at: Date.now(), wrote, seq: state.undoSeq,
+        diff: captured.diff, areas: captured.areas,
+        moreChanges: captured.moreChanges, truncated: captured.truncated,
+      };
     } else {
       m.runs[blockIndex] = {
         status: 'error',
         text: `❌ 执行失败${res.failedAt ? `（在 ${res.failedAt}）` : ''}：${res.error.message}`,
         at: Date.now(),
+        diff: captured.diff, areas: captured.areas, truncated: captured.truncated,
       };
     }
     if (res.logs?.length) m.logs = (m.logs || []).concat(res.logs);
@@ -500,6 +581,8 @@ export function initAiPanel(IC) {
     $('ai-send').disabled = busy;
     $('ai-input').disabled = busy;
     $('ai-stop').classList.toggle('hidden', !busy);
+    $('ai-del-session').disabled = busy;
+    $('ai-del-session-head').disabled = busy;
   }
   function setStatus(text) {
     if (text) $('ai-status').textContent = text;
@@ -533,6 +616,40 @@ export function initAiPanel(IC) {
     saveUi();
   };
   $('ai-close').onclick = () => { panel.classList.add('collapsed'); syncToggle(); saveUi(); };
+  function deleteCurrentSession() {
+    if (state.busy) { toastHint('正在生成回复，请先点「停止」再删除会话'); return; }
+    state.sessions = state.sessions.filter((x) => x.id !== state.currentId);
+    state.currentId = null;
+    if (!state.sessions.length) createSession(false);
+    else state.currentId = state.sessions[0].id;
+    saveSessions();
+    renderSessionList();
+    renderMessages();
+  }
+
+  /** 两段式确认：第一次点变成「确认删除」，3.5s 内再点一次才真删。 */
+  function armingConfirm(btn, onYes) {
+    if (btn.dataset.arming === '1') {
+      clearTimeout(Number(btn.dataset.timer) || 0);
+      delete btn.dataset.arming;
+      delete btn.dataset.timer;
+      btn.classList.remove('arm');
+      btn.textContent = btn.dataset.label || btn.textContent;
+      onYes();
+      return;
+    }
+    if (!btn.dataset.label) btn.dataset.label = btn.textContent;
+    btn.dataset.arming = '1';
+    btn.classList.add('arm');
+    btn.textContent = btn.classList.contains('icon') ? '确认?' : '再点一次确认删除';
+    btn.dataset.timer = String(setTimeout(() => {
+      delete btn.dataset.arming;
+      delete btn.dataset.timer;
+      btn.classList.remove('arm');
+      btn.textContent = btn.dataset.label;
+    }, 3500));
+  }
+
   $('ai-new-session').onclick = () => createSession(true);
   $('ai-settings-btn').onclick = () => openConfig();
   $('ai-save-cfg').onclick = () => { applyConfig(true); setConfigMsg('已保存。', 'ok'); };
@@ -542,15 +659,8 @@ export function initAiPanel(IC) {
     renderMessages();
     saveUi();
   };
-  $('ai-del-session').onclick = () => {
-    state.sessions = state.sessions.filter((x) => x.id !== state.currentId);
-    state.currentId = null;
-    if (!state.sessions.length) createSession(false);
-    else { state.currentId = state.sessions[0].id; }
-    saveSessions();
-    renderSessionList();
-    renderMessages();
-  };
+  $('ai-del-session').onclick = (ev) => armingConfirm(ev.currentTarget, deleteCurrentSession);
+  $('ai-del-session-head').onclick = (ev) => armingConfirm(ev.currentTarget, deleteCurrentSession);
   $('ai-autorun').checked = !!state.settings.autoRun;
   $('ai-autorun').onchange = (ev) => { state.settings.autoRun = ev.target.checked; saveSettings(); };
   $('ai-send').onclick = () => send();
@@ -570,6 +680,14 @@ export function initAiPanel(IC) {
     }
     const rb = ev.target.closest('[data-rollback]');
     if (rb) rollback(rb.dataset.rollback);
+    const fb = ev.target.closest('[data-flash]');
+    if (fb) {
+      const wrap = fb.closest('.ai-msg');
+      const m = currentSession().messages[Number(wrap?.dataset.msg)];
+      const run = m?.runs?.[fb.dataset.flash];
+      if (run?.areas?.length) { try { IC.highlightAreas?.(run.areas); } catch { /* ignore */ } }
+      else toastHint('这次执行没有可高亮的区域');
+    }
   });
 
   // 网格里撤销/重做后，重新启用已执行过的「运行」按钮
