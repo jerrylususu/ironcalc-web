@@ -221,6 +221,8 @@ export function initAiPanel(IC) {
 
     const blocks = extractCodeBlocks(m.content);
     const runs = m.runs || {};
+    // 只有真正写过工作簿的消息才给「回滚这次改动」；纯读/纯计算的执行不留快照、也不该出现这个按钮。
+    const anyWrote = Object.values(runs).some((r) => r?.wrote);
     const blockMeta = blocks.map((b, i) => {
       const run = runs[i];
       const disabled = runDisabled(run);
@@ -251,7 +253,7 @@ export function initAiPanel(IC) {
         d.textContent = n.text;
         box.appendChild(d);
       }
-      if (m.snapshotId && snapshots.has(m.snapshotId)) {
+      if (anyWrote && m.snapshotId && snapshots.has(m.snapshotId)) {
         const b = document.createElement('button');
         b.className = 'btn tiny';
         b.dataset.rollback = m.snapshotId;
@@ -359,7 +361,10 @@ export function initAiPanel(IC) {
     const block = extractCodeBlocks(m.content)[blockIndex];
     if (!block) return;
 
-    if (!m.snapshotId) {
+    const readOnly = isReadOnlyCode(block.code) && !scanCode(block.code).blocked;
+    // 只读代码不动工作簿，不需要留快照（省内存，也免得给只读操作挂个「回滚」按钮）；
+    // 写代码才在执行前存一份 xlsx。第一条写代码之前存，能覆盖整条消息的改动。
+    if (!m.snapshotId && !readOnly) {
       try {
         const sid = id('snap');
         snapshots.set(sid, IC.toXlsx());
@@ -382,6 +387,8 @@ export function initAiPanel(IC) {
       res = { ok: false, error: { message: String(e?.message || e) }, ops: [], logs: [], ms: 0 };
     }
     const captured = rec ? rec.finish() : { areas: [], diff: [], truncated: false, moreChanges: false };
+    // 写方法（含执行失败前已经生效的）——决定要不要显示「回滚这次改动」
+    const wrote = (res.ops || []).some((op) => IC_WRITE_METHODS.includes(op.name));
     // 纯视觉高亮这次真正动过的区域（失败前已执行的也算），不会修改单元格样式
     try { IC.highlightAreas?.(captured.areas); } catch { /* ignore */ }
     if (res.ok) {
@@ -390,7 +397,6 @@ export function initAiPanel(IC) {
       if (res.result !== undefined && res.result !== null && res.result !== '') {
         text += ` · 返回 ${JSON.stringify(res.result)}`;
       }
-      const wrote = (res.ops || []).some((op) => IC_WRITE_METHODS.includes(op.name));
       m.runs[blockIndex] = {
         status: 'ok', text, at: Date.now(), wrote, seq: state.undoSeq,
         diff: captured.diff, areas: captured.areas,
@@ -400,7 +406,7 @@ export function initAiPanel(IC) {
       m.runs[blockIndex] = {
         status: 'error',
         text: `❌ 执行失败${res.failedAt ? `（在 ${res.failedAt}）` : ''}：${res.error.message}`,
-        at: Date.now(),
+        at: Date.now(), wrote,
         diff: captured.diff, areas: captured.areas, truncated: captured.truncated,
       };
     }
@@ -429,6 +435,80 @@ export function initAiPanel(IC) {
   }
 
   // ------------------------------------------------------------ sending
+  // 模型常常把一次「找规律/核对数据」拆成好几轮读查询，每轮只发一个只读代码块。
+  // 所以这里做成一个小的 agent 循环：拿到回复 → 自动跑该跑的代码块 → 把执行结果
+  // 作为合成 user 消息回传（见 context.js 的 messagesToApi）→ 继续问，直到模型不再
+  // 发可自动执行的代码，或连续两轮跑的是同一段代码（防止原地打转）。
+  const MAX_ROUNDS = 12;
+
+  /** 请求一次模型回复：追加一条 assistant 消息、流式渲染，返回它的消息下标。 */
+  async function requestReply() {
+    const s = currentSession();
+    const history = messagesToApi(s.messages);
+    const messages = buildMessages({ history, system: SYSTEM_PROMPT });
+
+    const assistant = { id: id('m'), role: 'assistant', content: '', reasoning: '', at: Date.now() };
+    s.messages.push(assistant);
+    const index = s.messages.length - 1;
+    renderMessages();
+
+    const provider = createProvider(() => state.settings);
+    const absorb = (r) => {
+      if (!r) return;
+      if (r.content) assistant.content = r.content;
+      if (r.reasoning) assistant.reasoning = r.reasoning;
+      if (r.usage) assistant.usage = r.usage;
+      if (typeof r.ttftMs === 'number') assistant.ttftMs = r.ttftMs;
+    };
+    try {
+      const useStream = state.settings.stream !== false;
+      try {
+        absorb(await provider.chat(messages, {
+          stream: useStream,
+          signal: state.abort?.signal,
+          onDelta: (_d, full) => { assistant.content = full; updateStreamingBubble(index); },
+          onReasoning: (_d, full) => { assistant.reasoning = full; updateStreamingBubble(index); },
+        }));
+      } catch (e) {
+        const authFail = e instanceof ApiError && (e.status === 401 || e.status === 403);
+        if (useStream && !authFail && !assistant.content && !state.abort?.signal.aborted) {
+          // 有些 endpoint 不支持流式，退化成一次性返回再试
+          absorb(await provider.chat(messages, { stream: false, signal: state.abort?.signal }));
+        } else {
+          throw e;
+        }
+      }
+      if (!assistant.content.trim()) assistant.content = '（模型返回了空内容）';
+    } catch (e) {
+      console.error('[AI] 请求失败', e?.cause ?? e);
+      const msg = e instanceof ApiError ? e.message : String(e?.message || e);
+      assistant.content = (assistant.content ? assistant.content + '\n\n' : '') + `> ⚠️ 请求失败：${msg}`;
+    } finally {
+      assistant.reasoningDone = true;
+      s.updatedAt = Date.now();
+      saveSessions();
+      renderMessages();
+    }
+    return index;
+  }
+
+  /** 自动执行一条回复里该跑的代码块；返回真正跑过的代码签名（没跑返回 ''）。 */
+  async function autoRunBlocks(index, assistant) {
+    const blocks = extractCodeBlocks(assistant.content);
+    const ran = [];
+    for (let i = 0; i < blocks.length; i++) {
+      if (!blocks[i].runnable) continue;
+      // 只读代码块无需确认（不受「自动执行」开关影响）；写代码块只有开了自动执行才自动跑。
+      // 被静态扫描拦下的代码不自动跑，留给用户自己点。
+      const readOnly = isReadOnlyCode(blocks[i].code) && !scanCode(blocks[i].code).blocked;
+      if (readOnly || state.settings.autoRun) {
+        await runBlock(index, i);
+        ran.push(blocks[i].code);
+      }
+    }
+    return ran.join('\n---\n');
+  }
+
   async function send() {
     if (state.busy) return;
     const input = $('ai-input');
@@ -459,50 +539,21 @@ export function initAiPanel(IC) {
     renderMessages();
     saveSessions();
 
-    const history = messagesToApi(s.messages);
-    const messages = buildMessages({ history, system: SYSTEM_PROMPT });
-
-    const assistant = { id: id('m'), role: 'assistant', content: '', reasoning: '', at: Date.now() };
-    s.messages.push(assistant);
-    const index = s.messages.length - 1;
-    renderMessages();
-
     state.busy = true;
     state.abort = new AbortController();
     setBusy(true);
-    const provider = createProvider(() => state.settings);
-    const absorb = (r) => {
-      if (!r) return;
-      if (r.content) assistant.content = r.content;
-      if (r.reasoning) assistant.reasoning = r.reasoning;
-      if (r.usage) assistant.usage = r.usage;
-      if (typeof r.ttftMs === 'number') assistant.ttftMs = r.ttftMs;
-    };
     try {
-      const useStream = state.settings.stream !== false;
-      try {
-        absorb(await provider.chat(messages, {
-          stream: useStream,
-          signal: state.abort.signal,
-          onDelta: (_d, full) => { assistant.content = full; updateStreamingBubble(index); },
-          onReasoning: (_d, full) => { assistant.reasoning = full; updateStreamingBubble(index); },
-        }));
-      } catch (e) {
-        const authFail = e instanceof ApiError && (e.status === 401 || e.status === 403);
-        if (useStream && !authFail && !assistant.content && !state.abort.signal.aborted) {
-          // 有些 endpoint 不支持流式，退化成一次性返回再试
-          absorb(await provider.chat(messages, { stream: false, signal: state.abort.signal }));
-        } else {
-          throw e;
-        }
+      let lastRan = null;
+      for (let round = 0; round < MAX_ROUNDS; round++) {
+        const index = await requestReply();
+        const ran = await autoRunBlocks(index, s.messages[index]);
+        if (!ran) break;              // 模型给了最终回答（没有可自动跑的代码）
+        if (ran === lastRan) break;   // 又在跑一模一样的代码，避免原地打转
+        lastRan = ran;
+        if (state.abort?.signal.aborted) break;
+        setStatus(`继续第 ${round + 2} 轮…`);
       }
-      if (!assistant.content.trim()) assistant.content = '（模型返回了空内容）';
-    } catch (e) {
-      console.error('[AI] 请求失败', e?.cause ?? e);
-      const msg = e instanceof ApiError ? e.message : String(e?.message || e);
-      assistant.content = (assistant.content ? assistant.content + '\n\n' : '') + `> ⚠️ 请求失败：${msg}`;
     } finally {
-      assistant.reasoningDone = true;
       state.busy = false;
       state.abort = null;
       setBusy(false);
@@ -510,15 +561,6 @@ export function initAiPanel(IC) {
       s.updatedAt = Date.now();
       saveSessions();
       renderMessages();
-    }
-
-    // 只读代码块无需确认（不受「自动执行」开关影响）；写代码块只有开了自动执行才自动跑。
-    // 被静态扫描拦下的代码不自动跑，留给用户自己点。
-    const blocks = extractCodeBlocks(assistant.content);
-    for (let i = 0; i < blocks.length; i++) {
-      if (!blocks[i].runnable) continue;
-      const readOnly = isReadOnlyCode(blocks[i].code) && !scanCode(blocks[i].code).blocked;
-      if (readOnly || state.settings.autoRun) await runBlock(index, i);
     }
   }
 
@@ -583,6 +625,9 @@ export function initAiPanel(IC) {
     $('ai-stop').classList.toggle('hidden', !busy);
     $('ai-del-session').disabled = busy;
     $('ai-del-session-head').disabled = busy;
+    // agent 循环运行期间不让切/建会话，否则当前会话会被换掉、循环写错地方
+    $('ai-session').disabled = busy;
+    $('ai-new-session').disabled = busy;
   }
   function setStatus(text) {
     if (text) $('ai-status').textContent = text;

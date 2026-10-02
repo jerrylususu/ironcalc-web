@@ -37,6 +37,32 @@
         <option value="28">28</option>
         <option value="36">36</option>
       </select>
+      <div class="color-wrap" id="font-color-wrap">
+        <button id="btn-font-color" class="btn icon fmt color-btn" title="文字颜色">
+          <span class="color-glyph">A</span><span class="color-bar" id="font-color-bar"></span>
+        </button>
+        <div id="font-color-menu" class="menu color-menu hidden">
+          <div class="swatches" id="font-swatches"></div>
+          <div class="menu-sep"></div>
+          <div class="color-custom">
+            <input type="color" id="font-color-input" value="#000000" title="自定义颜色" />
+            <button id="font-color-clear" class="btn" title="恢复默认文字颜色">自动</button>
+          </div>
+        </div>
+      </div>
+      <div class="color-wrap" id="fill-color-wrap">
+        <button id="btn-fill-color" class="btn icon fmt color-btn" title="单元格背景色">
+          <span class="color-glyph fill-glyph"></span><span class="color-bar" id="fill-color-bar"></span>
+        </button>
+        <div id="fill-color-menu" class="menu color-menu hidden">
+          <div class="swatches" id="fill-swatches"></div>
+          <div class="menu-sep"></div>
+          <div class="color-custom">
+            <input type="color" id="fill-color-input" value="#fff3c4" title="自定义颜色" />
+            <button id="fill-color-clear" class="btn" title="清除背景色">无填充</button>
+          </div>
+        </div>
+      </div>
     </div>
     <span class="sep"></span>
     <label class="btn check" title="显示/隐藏网格线">
@@ -44,7 +70,7 @@
     </label>
     <span class="sep"></span>
     <div class="menu-wrap" id="text-tools">
-      <button id="btn-text-tools" class="btn" title="高亮/转换「看着像数字、其实是文本」的单元格">文本数字 ▾</button>
+      <button id="btn-text-tools" class="btn" title="高亮/转换「看着像数字、其实是文本」的单元格">文本/数字转换 ▾</button>
       <div id="text-tools-menu" class="menu hidden">
         <label class="btn check" title="高亮纯文本单元格（含非数字）">
           <input type="checkbox" id="chk-text" /> 高亮文本
@@ -53,8 +79,8 @@
           <input type="checkbox" id="chk-text-num" checked /> 只看数字
         </label>
         <div class="menu-sep"></div>
-        <button id="btn-numify" class="btn" disabled title="把当前选区里像数字的文本转成真数字">转选区</button>
-        <button id="btn-numify-all" class="btn" disabled title="把整张表里像数字的文本转成真数字">转全部</button>
+        <button id="btn-numify" class="btn" disabled title="把当前选区里像数字的文本转成真数字">选区转数字</button>
+        <button id="btn-numify-all" class="btn" disabled title="把整张表里像数字的文本转成真数字">整表转数字</button>
       </div>
     </div>
 
@@ -69,6 +95,10 @@
 
   <div id="fx-bar">
     <div id="cell-ref" class="cell-ref">A1</div>
+    <div id="fx-actions" class="hidden">
+      <button id="fx-cancel" class="fx-act reject" type="button" tabindex="-1" title="取消编辑 (Esc)">✗</button>
+      <button id="fx-accept" class="fx-act accept" type="button" tabindex="-1" title="确认 (Enter)">✓</button>
+    </div>
     <div class="fx-icon">fx</div>
     <input id="fx-input" type="text" spellcheck="false" autocomplete="off"
            placeholder="输入值或公式，如 12、=SUM(A1:A10)" />

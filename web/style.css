@@ -94,6 +94,31 @@ html, body {
   background: #fff;
 }
 
+/* 文字颜色 / 背景色：按钮下方一条色带显示当前颜色 */
+.color-wrap { position: relative; display: inline-flex; }
+.btn.color-btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 30px;
+  padding: 3px 7px 7px;
+}
+.color-glyph { font-size: 13px; font-weight: 700; line-height: 1; }
+.fill-glyph { width: 11px; height: 11px; border: 1.5px solid #5f6368; border-radius: 2px; }
+.color-bar { position: absolute; left: 4px; right: 4px; bottom: 2px; height: 3px; border-radius: 2px; background: #000; }
+.menu.color-menu { min-width: 0; padding: 8px; }
+.swatches { display: grid; grid-template-columns: repeat(6, 18px); gap: 4px; }
+.swatch { width: 18px; height: 18px; padding: 0; border: 1px solid rgba(0, 0, 0, 0.18); border-radius: 3px; cursor: pointer; }
+.swatch:hover { transform: scale(1.12); }
+.color-custom { display: flex; align-items: center; gap: 6px; }
+.color-custom input[type="color"] {
+  width: 34px; height: 24px; padding: 0;
+  border: 1px solid var(--border-strong); border-radius: 5px;
+  background: #fff; cursor: pointer;
+}
+.color-custom .btn { flex: 1 1 auto; justify-content: center; text-align: center; }
+
 /* 二级入口：默认只露一个按钮，点了才展开（低频功能） */
 .menu-wrap { position: relative; display: inline-flex; }
 .menu {
@@ -151,6 +176,34 @@ html, body {
   font-family: Georgia, serif;
   border-right: 1px solid var(--border);
 }
+#fx-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 4px;
+  flex: 0 0 auto;
+  border-right: 1px solid var(--border);
+  background: #fafbfc;
+}
+#fx-actions.hidden { display: none; }
+.fx-act {
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 4px;
+  padding: 0;
+  background: transparent;
+  color: #5f6368;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+.fx-act:hover { background: #eef1f4; color: #202124; }
+.fx-act.reject:hover { background: #fce8e6; color: #d93025; }
+.fx-act.accept:hover { background: #e6f4ea; color: #188038; }
 #fx-input {
   flex: 1 1 auto;
   border: 0;

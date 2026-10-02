@@ -36,6 +36,9 @@ const refOverlay = $('ref-overlay');
 const editorLayer = $('editor-layer');
 const tabList = $('tab-list');
 const fxInput = $('fx-input');
+const fxActionsEl = $('fx-actions');
+const fxCancelBtn = $('fx-cancel');
+const fxAcceptBtn = $('fx-accept');
 const cellRefEl = $('cell-ref');
 const statusEl = $('status');
 const wbNameEl = $('wb-name');
@@ -48,6 +51,7 @@ let model = null;
 let sheet = 0;
 let sel = { ar: 1, ac: 1, fr: 1, fc: 1 }; // anchor + focus（1-based 行列）
 let editing = null;
+let fxEdit = null; // 公式栏编辑会话 { r, c, original }
 let dragging = false;
 let pick = null; // 公式编辑时正在用鼠标选择的区域
 
@@ -82,6 +86,7 @@ function invalidate() {
 
 function selRange() {
   return {
+    sheet,
     r1: Math.min(sel.ar, sel.fr),
     r2: Math.max(sel.ar, sel.fr),
     c1: Math.min(sel.ac, sel.fc),
@@ -503,15 +508,57 @@ function setFontSize(size) {
   applyRangeStyle('font.size', n);
 }
 
+// 文字颜色 / 单元格背景色：预设色板 + 自定义取色，'' 表示自动/无填充
+const COLOR_SWATCHES = [
+  '#000000', '#434343', '#808080', '#cccccc', '#ffffff', '#f4f4f4',
+  '#d93025', '#e8710a', '#f9ab00', '#188038', '#1a73e8', '#9334e6',
+];
+const COLOR_PATH = { font: 'font.color', fill: 'fill.color' };
+const COLOR_NONE_BAR = 'repeating-linear-gradient(45deg,#bbb 0 3px,#fff 3px 6px)';
+
+function applyColor(kind, hex) {
+  try {
+    applyRangeStyle(COLOR_PATH[kind], hex);
+  } catch (e) { toast(String(e?.message || e), 'error'); }
+}
+
+function buildColorPalettes() {
+  for (const kind of ['font', 'fill']) {
+    const box = $(`${kind}-swatches`);
+    for (const hex of COLOR_SWATCHES) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'swatch';
+      b.style.background = hex;
+      b.title = hex;
+      b.onclick = () => { applyColor(kind, hex); closeMenus(); };
+      box.appendChild(b);
+    }
+  }
+}
+
 /** 工具栏按钮回显当前单元格的样式。 */
 function syncFormatToolbar() {
-  const f = currentStyle()?.font || {};
+  const st = currentStyle();
+  const f = st?.font || {};
   $('btn-bold').classList.toggle('on', !!f.b);
   $('btn-italic').classList.toggle('on', !!f.i);
   $('btn-underline').classList.toggle('on', !!f.u);
   $('btn-strike').classList.toggle('on', !!f.strike);
   const el = $('font-size');
   if (document.activeElement !== el) el.value = String(f.sz || 11);
+  syncColorButtons(st);
+}
+
+/** 色块/取色器回显当前单元格的文字色与背景色。 */
+function syncColorButtons(st = currentStyle()) {
+  const fc = resolveColor(st?.font?.color) || '';
+  const bc = resolveColor(st?.fill?.color) || '';
+  $('font-color-bar').style.background = /^#[0-9a-f]{6}$/i.test(fc) ? fc : '#000000';
+  $('fill-color-bar').style.background = /^#[0-9a-f]{6}$/i.test(bc) ? bc : COLOR_NONE_BAR;
+  const fi = $('font-color-input'), bi = $('fill-color-input');
+  if (document.activeElement !== fi && /^#[0-9a-f]{6}$/i.test(fc)) fi.value = fc;
+  if (document.activeElement !== bi && /^#[0-9a-f]{6}$/i.test(bc)) bi.value = bc;
 }
 
 // ---------------- 文本单元格高亮 + 一键转数字 ----------------
@@ -723,6 +770,7 @@ function renderOverlays() {
 
 function renderRef() {
   cellRefEl.textContent = rangeLabel();
+  updateFxActions();
   if (editing) {
     // 单元格内编辑时，公式栏跟随显示正在编辑的内容
     if (fxInput.value !== editing.el.value) fxInput.value = editing.el.value;
@@ -904,6 +952,7 @@ function startEdit(initial) {
 
   editorLayer.appendChild(el);
   editing = { el, r, c, original: raw };
+  updateFxActions();
 
   el.addEventListener('keydown', (ev) => {
     // 编辑器自己的按键不再冒泡给网格（否则 Enter/Tab 会被处理两次、Backspace 会清空整格）
@@ -953,6 +1002,65 @@ function cancelEdit() {
   pick = null;
   hideRefHighlight();
   ed.el.remove();
+  focusGrid();
+  render();
+}
+
+// ---- 公式栏编辑会话：聚焦公式栏进入编辑态，勾/叉/回车/失焦决定是否提交 ----
+// 行为对齐 Excel：编辑时公式栏左侧出现 ✗ ✓。点 ✗ 放弃本次修改（还原原值），
+// 点 ✓ / 回车 / 焦点移出则提交。
+function updateFxActions() {
+  fxActionsEl.classList.toggle('hidden', !fxEdit && !editing);
+}
+
+function beginFxEdit() {
+  if (fxEdit) return;
+  const r = sel.ar, c = sel.ac;
+  let original = '';
+  try { original = model.getCellContent(sheet, r, c); } catch { /* ignore */ }
+  fxEdit = { r, c, original };
+  updateFxActions();
+}
+
+function commitFxEdit(move, refocus) {
+  if (!fxEdit) return;
+  const ed = fxEdit;
+  fxEdit = null;
+  updateFxActions();
+  hideRefHighlight();
+  const value = fxInput.value;
+  if (value !== ed.original) {
+    try { model.setUserInput(sheet, ed.r, ed.c, value); invalidate(); }
+    catch (e) { toast('公式错误: ' + e, 'error'); }
+  }
+  if (move) {
+    const r = Math.min(GRID_ROWS, Math.max(1, ed.r + move.dr));
+    const c = Math.min(GRID_COLS, Math.max(1, ed.c + move.dc));
+    sel = { ar: r, ac: c, fr: r, fc: c };
+  }
+  if (move || refocus) focusGrid();
+  render();
+}
+
+function cancelFxEdit() {
+  if (!fxEdit) return;
+  const ed = fxEdit;
+  fxEdit = null;
+  updateFxActions();
+  hideRefHighlight();
+  // 还原公式栏显示（此时输入框仍处于聚焦态，renderRef 不会覆盖它）
+  fxInput.value = ed.original;
+}
+
+// 公式栏勾/叉：同时兼容单元格内编辑器（双击进入的编辑态）。
+function acceptFxAction() {
+  if (editing) { commitEdit(null); return; }
+  if (fxEdit) commitFxEdit(null, true);
+}
+
+function rejectFxAction() {
+  if (editing) { cancelEdit(); return; }
+  if (fxEdit) cancelFxEdit();
   focusGrid();
   render();
 }
@@ -1217,22 +1325,19 @@ window.addEventListener('resize', () => scheduleRender());
 // ---------------------------------------------------------------- formula bar
 fxInput.addEventListener('focus', () => {
   try { fxInput.value = model.getCellContent(sheet, sel.ar, sel.ac); } catch { /* ignore */ }
+  beginFxEdit();
   fxInput.select();
 });
 
 fxInput.addEventListener('keydown', (ev) => {
   if (ev.key === 'Enter') {
     ev.preventDefault();
-    const v = fxInput.value;
-    const r = sel.ar, c = sel.ac;
-    try { model.setUserInput(sheet, r, c, v); invalidate(); } catch (e) { toast('公式错误: ' + e, 'error'); }
-    sel = { ar: Math.min(GRID_ROWS, r + 1), ac: c, fr: Math.min(GRID_ROWS, r + 1), fc: c };
-    render();
-    focusGrid();
+    commitFxEdit({ dr: 1, dc: 0 }, true);
   } else if (ev.key === 'Escape') {
     ev.preventDefault();
-    renderRef();
+    cancelFxEdit();
     focusGrid();
+    render();
   }
 });
 
@@ -1240,7 +1345,16 @@ fxInput.addEventListener('input', updateRefHighlight);
 fxInput.addEventListener('click', updateRefHighlight);
 fxInput.addEventListener('keyup', updateRefHighlight);
 fxInput.addEventListener('select', updateRefHighlight);
-fxInput.addEventListener('blur', hideRefHighlight);
+fxInput.addEventListener('blur', () => {
+  hideRefHighlight();
+  if (fxEdit) commitFxEdit(null);
+});
+
+// 勾/叉按钮：mousedown 取消默认行为，避免点按钮时先把编辑框失焦提交掉。
+fxCancelBtn.addEventListener('mousedown', (ev) => ev.preventDefault());
+fxAcceptBtn.addEventListener('mousedown', (ev) => ev.preventDefault());
+fxCancelBtn.addEventListener('click', rejectFxAction);
+fxAcceptBtn.addEventListener('click', () => { acceptFxAction(); focusGrid(); });
 
 // ---------------------------------------------------------------- toolbar
 $('btn-new').onclick = () => newWorkbook();
@@ -1261,17 +1375,34 @@ function syncTextTools() {
   const open = !textMenu.classList.contains('hidden');
   $('btn-text-tools').classList.toggle('on', open || $('chk-text').checked);
 }
-$('btn-text-tools').onclick = (ev) => {
-  ev.stopPropagation();
-  textMenu.classList.toggle('hidden');
+
+// 工具栏二级菜单（文本/数字转换、文字色、背景色）互斥展开
+const COLOR_MENUS = { font: 'font-color-menu', fill: 'fill-color-menu' };
+function closeMenus() {
+  textMenu.classList.add('hidden');
+  for (const id of Object.values(COLOR_MENUS)) $(id).classList.add('hidden');
   syncTextTools();
-};
+  syncColorButtons();
+}
+function toggleMenu(id) {
+  const wasHidden = $(id).classList.contains('hidden');
+  closeMenus();
+  if (wasHidden) $(id).classList.remove('hidden');
+}
+
+$('btn-text-tools').onclick = (ev) => { ev.stopPropagation(); toggleMenu('text-tools-menu'); };
+$('btn-font-color').onclick = (ev) => { ev.stopPropagation(); toggleMenu(COLOR_MENUS.font); };
+$('btn-fill-color').onclick = (ev) => { ev.stopPropagation(); toggleMenu(COLOR_MENUS.fill); };
 document.addEventListener('click', (ev) => {
-  if (!textMenu.classList.contains('hidden') && !ev.target.closest('#text-tools')) {
-    textMenu.classList.add('hidden');
-    syncTextTools();
-  }
+  if (ev.target.closest('.menu-wrap, .color-wrap')) return;
+  closeMenus();
 });
+$('font-color-input').onchange = (ev) => { applyColor('font', ev.target.value); closeMenus(); };
+$('fill-color-input').onchange = (ev) => { applyColor('fill', ev.target.value); closeMenus(); };
+$('font-color-clear').onclick = () => { applyColor('font', ''); closeMenus(); };
+$('fill-color-clear').onclick = () => { applyColor('fill', ''); closeMenus(); };
+buildColorPalettes();
+
 $('chk-text').onchange = () => { textFlagKey = ''; textFlagRenderedKey = ''; render(); syncTextTools(); };
 $('chk-text-num').onchange = () => { textFlagKey = ''; textFlagRenderedKey = ''; render(); };
 $('btn-numify').onclick = () => numify('selection');
