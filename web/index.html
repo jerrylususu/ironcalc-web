@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>IronCalc Web — 迷你 Excel</title>
+<link rel="stylesheet" href="./style.css" />
+<link rel="stylesheet" href="./ai.css" />
+</head>
+<body>
+<div id="app">
+  <header id="toolbar">
+    <div class="brand">IronCalc<span class="tag">wasm</span></div>
+
+    <button id="btn-new" class="btn">新建</button>
+    <button id="btn-open" class="btn">打开</button>
+    <button id="btn-save" class="btn">保存</button>
+    <span class="sep"></span>
+    <button id="btn-undo" class="btn icon" title="撤销 (Ctrl+Z)">↶</button>
+    <button id="btn-redo" class="btn icon" title="重做 (Ctrl+Y)">↷</button>
+    <span class="sep"></span>
+    <label class="btn check" title="显示/隐藏网格线">
+      <input type="checkbox" id="chk-grid" checked /> 网格线
+    </label>
+
+    <input id="file-input" type="file" accept=".xlsx,.xlsm" hidden />
+
+    <div class="spacer"></div>
+    <div id="status" class="status"></div>
+    <div id="wb-name" class="wb-name">Workbook1</div>
+    <span class="sep"></span>
+    <button id="btn-ai" class="btn ai-toggle" title="AI 助手">✦ AI</button>
+  </header>
+
+  <div id="fx-bar">
+    <div id="cell-ref" class="cell-ref">A1</div>
+    <div class="fx-icon">fx</div>
+    <input id="fx-input" type="text" spellcheck="false" autocomplete="off"
+           placeholder="输入值或公式，如 12、=SUM(A1:A10)" />
+  </div>
+
+  <div id="grid">
+    <div id="corner"></div>
+    <div id="col-headers"><div id="col-headers-inner"></div></div>
+    <div id="row-headers"><div id="row-headers-inner"></div></div>
+    <div id="scroll">
+      <div id="canvas">
+        <div id="cells-layer"></div>
+        <div id="overlay-layer">
+          <div id="flash-layer"></div>
+          <div id="range-overlay" class="hidden"></div>
+          <div id="active-overlay" class="hidden"></div>
+        </div>
+        <div id="editor-layer"></div>
+      </div>
+    </div>
+  </div>
+
+  <footer id="tabs">
+    <div id="tab-list"></div>
+    <button id="btn-add-sheet" class="tab add" title="新建工作表">＋</button>
+  </footer>
+</div>
+
+<div id="toast" class="hidden"></div>
+
+<aside id="ai-panel" class="collapsed">
+  <div id="ai-head">
+    <span class="ai-title">AI 助手</span>
+    <select id="ai-session" title="切换会话"></select>
+    <button id="ai-new-session" class="btn icon" title="新会话">＋</button>
+    <button id="ai-settings-btn" class="btn icon" title="设置 endpoint / api key / model">⚙</button>
+    <button id="ai-close" class="btn icon" title="收起面板">×</button>
+  </div>
+
+  <div id="ai-config" class="hidden">
+    <label class="ai-field">Endpoint (base_url)
+      <input id="ai-baseurl" type="text" spellcheck="false" placeholder="http://127.0.0.1:8766/v1" />
+    </label>
+    <label class="ai-field">API Key
+      <input id="ai-apikey" type="password" spellcheck="false" placeholder="sk-…（本地假服务可留空）" />
+    </label>
+    <label class="ai-field">Model
+      <input id="ai-model" type="text" spellcheck="false" placeholder="mock-gpt" />
+    </label>
+    <label class="ai-field">Temperature（留空用服务端默认）
+      <input id="ai-temp" type="number" min="0" max="2" step="0.1" placeholder="0.2" />
+    </label>
+    <label class="ai-check"><input type="checkbox" id="ai-context" checked /> 每次请求带上表格快照</label>
+    <label class="ai-check"><input type="checkbox" id="ai-stream" checked /> 流式输出（不支持就自动退回非流式）</label>
+    <div class="ai-config-actions">
+      <button id="ai-save-cfg" class="btn primary">保存</button>
+      <button id="ai-test-cfg" class="btn">测试连接</button>
+      <button id="ai-del-session" class="btn danger">删除当前会话</button>
+    </div>
+    <div id="ai-config-msg" class="ai-hint"></div>
+  </div>
+
+  <div id="ai-messages"></div>
+
+  <div id="ai-compose">
+    <textarea id="ai-input" rows="3" spellcheck="false"
+      placeholder="例如：把 D2:D4 改成含税价（6%），并在 D5 写合计公式；表头加粗居中"></textarea>
+    <div id="ai-compose-actions">
+      <label class="ai-check"><input type="checkbox" id="ai-autorun" /> 自动执行</label>
+      <span class="spacer"></span>
+      <span id="ai-status" class="ai-hint"></span>
+      <button id="ai-stop" class="btn hidden">停止</button>
+      <button id="ai-send" class="btn primary">发送</button>
+    </div>
+  </div>
+</aside>
+
+<script type="module" src="./app.js"></script>
+</body>
+</html>

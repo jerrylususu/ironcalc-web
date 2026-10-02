@@ -1,0 +1,8 @@
+tmp/
+node_modules/
+web/pkg/
+IronCalc/target/
+*.log
+
+# External vendor (cloned separately from github.com/ironcalc/IronCalc)
+IronCalc/
