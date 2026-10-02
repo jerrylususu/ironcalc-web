@@ -73,9 +73,10 @@ export function renderMarkdown(text, { blockMeta = [] } = {}) {
       i++; // 跳过闭合围栏
       const meta = blockMeta[blockIndex] || {};
       const runnable = meta.runnable ?? isRunnable(lang);
+      const dis = meta.disabled ? ' disabled' : '';
       const head = runnable
         ? `<div class="ai-code-head"><span class="ai-lang">${escapeHtml(lang || 'js')}</span>` +
-          `<button class="ai-run" data-block="${blockIndex}">${escapeHtml(meta.label || '运行')}</button></div>`
+          `<button class="ai-run" data-block="${blockIndex}"${dis}>${escapeHtml(meta.label || '运行')}</button></div>`
         : `<div class="ai-code-head"><span class="ai-lang">${escapeHtml(lang || 'code')}</span></div>`;
       out.push(
         `<div class="ai-code" data-lang="${escapeHtml(lang)}" data-block="${blockIndex}">` +

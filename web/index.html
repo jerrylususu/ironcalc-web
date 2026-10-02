@@ -19,9 +19,38 @@
     <button id="btn-undo" class="btn icon" title="撤销 (Ctrl+Z)">↶</button>
     <button id="btn-redo" class="btn icon" title="重做 (Ctrl+Y)">↷</button>
     <span class="sep"></span>
+    <div class="fmt-group">
+      <button id="btn-bold" class="btn icon fmt" title="加粗 (Ctrl+B)"><b>B</b></button>
+      <button id="btn-italic" class="btn icon fmt" title="斜体 (Ctrl+I)"><i>I</i></button>
+      <button id="btn-underline" class="btn icon fmt" title="下划线 (Ctrl+U)"><u>U</u></button>
+      <button id="btn-strike" class="btn icon fmt" title="删除线"><s>S</s></button>
+      <select id="font-size" class="fmt-size" title="字号">
+        <option value="9">9</option>
+        <option value="10">10</option>
+        <option value="11">11</option>
+        <option value="12">12</option>
+        <option value="14">14</option>
+        <option value="16">16</option>
+        <option value="18">18</option>
+        <option value="20">20</option>
+        <option value="24">24</option>
+        <option value="28">28</option>
+        <option value="36">36</option>
+      </select>
+    </div>
+    <span class="sep"></span>
     <label class="btn check" title="显示/隐藏网格线">
       <input type="checkbox" id="chk-grid" checked /> 网格线
     </label>
+    <span class="sep"></span>
+    <label class="btn check" title="高亮文本单元格（比如「看着像数字、其实是文本」的格子）">
+      <input type="checkbox" id="chk-text" /> 文本
+    </label>
+    <label class="btn check" title="只高亮看着像数字的文本">
+      <input type="checkbox" id="chk-text-num" checked /> 只看数字
+    </label>
+    <button id="btn-numify" class="btn" disabled title="把当前选区里像数字的文本转成真数字">转选区</button>
+    <button id="btn-numify-all" class="btn" disabled title="把整张表里像数字的文本转成真数字">转全部</button>
 
     <input id="file-input" type="file" accept=".xlsx,.xlsm" hidden />
 
@@ -47,6 +76,8 @@
       <div id="canvas">
         <div id="cells-layer"></div>
         <div id="overlay-layer">
+          <div id="text-layer"></div>
+          <div id="ref-overlay" class="hidden"></div>
           <div id="flash-layer"></div>
           <div id="range-overlay" class="hidden"></div>
           <div id="active-overlay" class="hidden"></div>

@@ -57,6 +57,8 @@ export const SYSTEM_PROMPT = `你是一个嵌在网页版表格（IronCalc / was
 - 如果需求有歧义（比如“整理一下”但没说怎么整理），先问一个具体问题，不要猜。
 - 不要写死循环、不要请求网络、不要访问 window/document/localStorage。
 - 用户说“撤销”就输出 \`IC.undo()\`。
+- 你之前代码的执行结果会以「【代码执行结果】」消息出现在对话里（包含返回值、错误和 console 输出），
+  可以直接引用，不要说"我看不到执行结果"。
 
 ## API
 ${IC_API_DOC}`;

@@ -29,6 +29,34 @@ export const IC_WHITELIST = [
 /** 沙箱里可以直接读的属性（getter）。 */
 export const IC_READONLY_PROPS = ['sheet'];
 
+/**
+ * 会改动工作簿（或历史）的方法。用来判断「这段代码要不要用户确认」：
+ * 只要没碰到这些，就是纯读取/纯计算，可以自动执行。
+ * 注意：选区、切换工作表、toast 等只影响界面不碰数据，不算写。
+ */
+export const IC_WRITE_METHODS = [
+  'setCell', 'setRange', 'clearRange', 'applyStyle', 'format',
+  'setColumnWidth', 'setRowHeight',
+  'insertRows', 'insertColumns', 'deleteRows', 'deleteColumns',
+  'merge', 'unmerge',
+  'newSheet', 'renameSheet', 'deleteSheet', 'setName',
+  'undo', 'redo',
+];
+
+/**
+ * 静态判断代码是否「只读」。
+ * 保守：出现过任何写方法名，或用了 `IC[...]` 这种静态看不出来的动态访问，
+ * 都当作可能写（需要确认）。只有纯读/纯计算才返回 true。
+ */
+export function isReadOnlyCode(code) {
+  const src = String(code ?? '');
+  if (/\bIC\s*\[/.test(src)) return false;
+  for (const name of IC_WRITE_METHODS) {
+    if (new RegExp(`\\b${name}\\b`).test(src)) return false;
+  }
+  return true;
+}
+
 const FORBIDDEN = [
   [/\bimport\s*\(/, 'import() 动态导入'],
   [/\brequire\s*\(/, 'require()'],

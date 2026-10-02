@@ -1,5 +1,33 @@
 # todo.md
 
+## ✅ 本轮完成（短期清单，除 #3 自动执行高亮外全做）
+
+- **#1 运行按钮跑过就灰**：写操作执行成功后按钮变「已执行」不可点；
+  点「回滚这次改动」或 `Ctrl+Z`/`Ctrl+Y`（任意撤销/重做）后恢复「再运行一次」。
+  实现：`panel.js` 的 `runDisabled()` + `state.undoSeq`（`app.js` 撤销/重做时
+  `notifyHistory()` 发 `ic:history` 事件）。
+- **#2 只读免确认**：`sandbox.js` 新增 `IC_WRITE_METHODS` + `isReadOnlyCode()`；
+  只读/纯计算的代码块回复一到就自动跑（不受「自动执行」开关影响），含写方法或 `IC[...]` 动态访问的要手点。
+- **#4 格式工具栏**：加粗/斜体/下划线/删除线 + 字号下拉；`Ctrl+B/I/U`；
+  按钮回显当前单元格样式；补上了 `.cell.strike` 渲染（原来只存样式不显示）。
+- **#5 公式引用染色**：编辑公式时把文本光标所在的 A1 引用用紫色虚线框圈出来
+  （`refTokenAt()`，排除 `LOG10(` 这类函数名）；单元格编辑器和公式栏都生效。
+- **#6 reasoning 展示**：`provider.js` 收 `delta.reasoning_content`（兼容 `reasoning`）并流式回调；
+  面板渲染成可折叠「💭 思考过程」，**不回传进历史**。
+- **#7 文本单元格高亮 + 转数字**：工具栏勾「文本」→ 像数字的文本绿色淡底 + 左上角小三角；
+  二级「只看数字」可切「全部文本」；「转选区」/「转全部」一键转成真数字
+  （先清 `@` 文本格式让引擎自己解析，认不出再用本地清洗兑底）。
+- **#8 ttft / token**：`provider.js` 请求带 `stream_options.include_usage`，
+  从最后一个 chunk 取 usage，记录首个 delta 时间；面板底部显示「首字 x.xs · ↑… ↓… · 缓存 … · 思考 …」。
+- **#9 执行结果回传 + prefix cache**：`context.js` 新增 `composeUserContent()` / `messagesToApi()`；
+  快照在发消息当刻拼进用户消息的 `apiContent` 存下，执行结果作为**合成的 user 消息**追加；
+  整个历史数组只追加不改写，第 N 轮是第 N+1 轮的前缀。
+
+验证：`node tmp/test_ai.mjs` + `node tmp/test_wasm.mjs` 全绿（新增 reasoning/usage/ttft、
+`isReadOnlyCode`、append-only、disabled 按钮等断言）。UI 请按 `notes.md` 验收清单 26–34 条手动过。
+
+---
+
 ## ✅ 已修复（AI 改动高亮这一轮）
 
 4. ~~AI 跑完之后「行/列被莫名加粗，原有加粗被破坏」~~
@@ -53,68 +81,5 @@
 ---
 短期
 
-- 运行 / 回滚 改动 是不是应该点完之后变灰，点了负向操作之后再重新启用？
-- 只读操作无需确认？ 只有写操作才需要确认？
-     已执行：getSelection、getCell（1ms） · 返回 {"表":"Sheet1","范围":"J8","行列":"8行 10列","J8原始内容":"928.79","J8显示值":"928.79"}
-- 自动执行好像不会触发高亮动画？
-- 加一些基本的格式设置 加粗 斜体 删除线 字体大小？
-- 编辑公式的时候，光标所在的范围/单元格 对应边框染色 类似excel那样？
-- thinking 的应该支持展示？reasoning_content
-{"id":"e15a833e-f934-45da-8627-945e0430796a","object":"chat.completion.chunk","created":1790956019,"model":"deepseek-flash","system_fingerprint":"aeb56401ca74e127821c4f9126dcb669","choices":[{"index":0,"delta":{"role":"assistant","content":null,"reasoning_content":""},"logprobs":null,"finish_reason":null}]}
-{"id":"e15a833e-f934-45da-8627-945e0430796a","object":"chat.completion.chunk","created":1790956019,"model":"deepseek-flash","system_fingerprint":"aeb56401ca74e127821c4f9126dcb669","choices":[{"index":0,"delta":{"content":null,"reasoning_content":"The"},"logprobs":null,"finish_reason":null}]}
-- 加一个功能 展示文本单元格 （因为可能会对计算造成干扰），一键重置为通用/数字单元格？
-- 每次对话显示 ttft, token 消耗？（可以先只支持ds 官方，但是做成抽象能力，未来可以适配其他api）
-{
-    "id": "e15a833e-f934-45da-8627-945e0430796a",
-    "object": "chat.completion.chunk",
-    "created": 1790956019,
-    "model": "deepseek-flash",
-    "system_fingerprint": "aeb56401ca74e127821c4f9126dcb669",
-    "choices": [
-        {
-            "index": 0,
-            "delta": {
-                "content": "",
-                "reasoning_content": null
-            },
-            "logprobs": null,
-            "finish_reason": "stop"
-        }
-    ],
-    "usage": {
-        "prompt_tokens": 3235,
-        "completion_tokens": 15469,
-        "total_tokens": 18704,
-        "prompt_tokens_details": {
-            "cached_tokens": 1536
-        },
-        "completion_tokens_details": {
-            "reasoning_tokens": 14902
-        },
-        "prompt_cache_hit_tokens": 1536,
-        "prompt_cache_miss_tokens": 1699
-    }
-}
 
-- 执行结果会回传吗？应该回传？（拼接后面 不要破坏 prefix cache！）
-预期结果：非空个数 = 5，但真数字个数 = 0 → 坐实是文本。
-
-确认后，用下面这段把 G3:G7 转成真数字（去掉逗号，空单元格原样保留），G8 就会立刻显示正确合计，且以后改上面几行会自动跟着变：
-
-js
-再运行一次
-const raw = IC.getRangeRaw('G3:G7');
-const nums = raw.map(([v]) => {
-  const s = String(v ?? '').trim();
-  if (s === '') return [''];               // 空单元格不动
-  const n = Number(s.replace(/,/g, ''));
-  return [isNaN(n) ? v : n];               // 转不动的原样保留
-});
-IC.setRange('G3:G7', nums);
-
-return { 转换后: IC.getRange('G3:G7'), G8结果: IC.getCell('G8').value };
-顺带说一句：G15（谢晓丽那 6 行）大概率也是同样情况，转换时把范围扩到 G3:G15 更稳妥；要的话我帮你一起处理。
-
-第 1 段：✅ 已执行：getRangeRaw、getRange、setCell×2、getCell×6、clearRange（16ms） · 返回 {"G3G7原始输入":["[…1 项]","[…1 项]","[…1 项]","[…1 项]","[…1 项]"],"探针":{"真数字个数":"0","非空个数":"5"},"G8":{"公式":"=SUM(G3:G7)","结果":"0"},"J8":{"公式":"=SUM(J3:J7)","结果":"928.79"}}
-第 2 段：✅ 已执行：getRangeRaw、setRange、getRange、getCell（7ms） · 返回 {"转换后":["[…1 项]","[…1 项]","[…1 项]","[…1 项]","[…1 项]"],"G8结果":"11800"}
-你能看到之前的运行结果吗
+- 自动执行好像不会触发高亮动画？bug 待排查

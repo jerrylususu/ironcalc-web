@@ -36,6 +36,8 @@ html, body {
   display: flex;
   align-items: center;
   gap: 6px;
+  row-gap: 6px;
+  flex-wrap: wrap;
   padding: 6px 10px;
   background: linear-gradient(#ffffff, #f7f8fa);
   border-bottom: 1px solid var(--border);
@@ -79,6 +81,18 @@ html, body {
 .btn.icon { font-size: 15px; line-height: 1; padding: 3px 9px; }
 .btn.check { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
 .btn.check input { margin: 0; }
+.btn.on { background: #e8f0fe; border-color: var(--accent); color: #174ea6; }
+.fmt-group { display: inline-flex; align-items: center; gap: 2px; }
+.btn.fmt { min-width: 28px; text-align: center; padding: 3px 6px; }
+.btn.fmt b, .btn.fmt i, .btn.fmt u, .btn.fmt s { font-size: 13px; }
+.fmt-size {
+  font: inherit;
+  font-size: 12px;
+  padding: 3px 4px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: #fff;
+}
 
 .sep { width: 1px; height: 20px; background: var(--border); margin: 0 4px; }
 .spacer { flex: 1 1 auto; }
@@ -229,10 +243,36 @@ html, body {
 .cell.bold { font-weight: 600; }
 .cell.italic { font-style: italic; }
 .cell.underline { text-decoration: underline; }
+.cell.strike { text-decoration: line-through; }
 .cell.error { color: #d93025; }
 .cell .txt { overflow: hidden; text-overflow: clip; }
 
 #flash-layer { position: absolute; inset: 0; }
+
+/* 文本单元格高亮：绿色淡底 + 左上角小三角，纯视觉 */
+#text-layer { position: absolute; inset: 0; }
+.text-flag {
+  position: absolute;
+  background: rgba(15, 157, 88, 0.13);
+  box-shadow: inset 0 0 0 1px rgba(15, 157, 88, 0.34);
+  border-radius: 1px;
+}
+.text-flag::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  border-top: 6px solid #0f9d58;
+  border-right: 6px solid transparent;
+}
+
+/* 编辑公式时，光标所在引用对应的单元格/区域 */
+#ref-overlay {
+  position: absolute;
+  border: 2px dashed #7b1fa2;
+  background: rgba(123, 31, 162, 0.07);
+  border-radius: 1px;
+}
 /* AI 改动高亮：高亮边框 + 淡背景，纯视觉、不写进单元格样式，自动淡出 */
 .flash-box {
   position: absolute;

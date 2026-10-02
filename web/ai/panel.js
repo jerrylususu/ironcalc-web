@@ -8,8 +8,8 @@
 // 可以在 Node 里单测，见 tmp/test_ai.mjs。
 
 import { createProvider, ApiError, normalizeBaseUrl } from './provider.js';
-import { runAiCode, IC_WHITELIST, summarizeOps } from './sandbox.js';
-import { buildContext, buildMessages } from './context.js';
+import { runAiCode, IC_WHITELIST, IC_WRITE_METHODS, summarizeOps, isReadOnlyCode, scanCode } from './sandbox.js';
+import { buildContext, buildMessages, composeUserContent, messagesToApi } from './context.js';
 import { SYSTEM_PROMPT } from './prompt.js';
 import { extractCodeBlocks, renderMarkdown } from './markdown.js';
 
@@ -51,6 +51,8 @@ export function initAiPanel(IC) {
     currentId: null,
     busy: false,
     abort: null,
+    // 每次撤销/重做/回滚 +1；执行记录里存的 seq 与之不等时，"运行"按钮重新可点
+    undoSeq: 0,
   };
   const snapshots = new Map();
   let snapSeq = 0;
@@ -93,9 +95,12 @@ export function initAiPanel(IC) {
           id: m.id,
           role: m.role,
           content: m.content,
+          reasoning: m.reasoning ? String(m.reasoning).slice(0, 8000) : undefined,
+          usage: m.usage || undefined,
+          ttftMs: m.ttftMs,
           at: m.at,
           runs: m.runs
-            ? Object.fromEntries(Object.entries(m.runs).map(([k, v]) => [k, { status: v.status, text: v.text, at: v.at }]))
+            ? Object.fromEntries(Object.entries(m.runs).map(([k, v]) => [k, { status: v.status, text: v.text, at: v.at, wrote: v.wrote, seq: v.seq }]))
             : undefined,
           logs: m.logs ? m.logs.slice(0, 5) : undefined,
         })),
@@ -157,58 +162,109 @@ export function initAiPanel(IC) {
     box.scrollTop = box.scrollHeight;
   }
 
+  /** 执行成功且是写操作的代码块：跑过就把「运行」禁掉，撤销/重做/回滚后可重跑。 */
+  function runDisabled(run) {
+    if (!run || run.status !== 'ok' || !run.wrote) return false;
+    return run.seq === undefined ? true : run.seq === state.undoSeq;
+  }
+
+  function shortNum(n) {
+    if (n === null || n === undefined) return '?';
+    return n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n);
+  }
+
+  /** 一条消息底部的「首字延迟 · token」元信息。 */
+  function usageText(m) {
+    const parts = [];
+    if (typeof m.ttftMs === 'number') parts.push(`首字 ${(m.ttftMs / 1000).toFixed(1)}s`);
+    const u = m.usage;
+    if (u && (u.total_tokens || u.prompt_tokens || u.completion_tokens)) {
+      parts.push(`↑${shortNum(u.prompt_tokens)} ↓${shortNum(u.completion_tokens)}`);
+      const cached = u.prompt_tokens_details?.cached_tokens ?? u.prompt_cache_hit_tokens;
+      if (cached) parts.push(`缓存 ${shortNum(cached)}`);
+      if (u.completion_tokens_details?.reasoning_tokens) {
+        parts.push(`思考 ${shortNum(u.completion_tokens_details.reasoning_tokens)}`);
+      }
+    }
+    return parts.join(' · ');
+  }
+
+  /** 把一条消息渲染成气泡 DOM（普通渲染和流式刷新共用）。 */
+  function buildBubble(m, { streaming = false } = {}) {
+    const bubble = document.createElement('div');
+    bubble.className = 'ai-bubble';
+    if (m.role === 'user') { bubble.textContent = m.content; return bubble; }
+
+    if (m.reasoning) {
+      const d = document.createElement('details');
+      d.className = 'ai-think';
+      if (streaming || !m.reasoningDone) d.open = true;
+      const sum = document.createElement('summary');
+      sum.textContent = m.reasoningDone ? '思考过程' : '思考中…';
+      const body = document.createElement('div');
+      body.className = 'ai-think-body';
+      body.textContent = m.reasoning;
+      d.append(sum, body);
+      bubble.appendChild(d);
+    }
+
+    const blocks = extractCodeBlocks(m.content);
+    const runs = m.runs || {};
+    const blockMeta = blocks.map((b, i) => {
+      const run = runs[i];
+      const disabled = runDisabled(run);
+      let label = '运行';
+      if (disabled) label = '已执行';
+      else if (run?.status === 'error') label = '重新运行';
+      else if (run) label = '再运行一次';
+      else if (b.runnable && isReadOnlyCode(b.code)) label = '只读 · 自动运行';
+      return { runnable: b.runnable, label, disabled };
+    });
+    const md = document.createElement('div');
+    md.className = 'ai-md';
+    md.innerHTML = renderMarkdown(m.content || '…', { blockMeta });
+    bubble.appendChild(md);
+
+    const notes = [];
+    for (const [i, r] of Object.entries(runs).sort((a, b) => Number(a[0]) - Number(b[0]))) {
+      const prefix = Object.keys(runs).length > 1 ? `第 ${Number(i) + 1} 段：` : '';
+      notes.push({ kind: r.status, text: prefix + r.text });
+    }
+    if (m.logs?.length) notes.push({ kind: 'muted', text: 'console: ' + m.logs.map((l) => l.text).join(' | ') });
+    if (notes.length) {
+      const box = document.createElement('div');
+      box.className = 'ai-notes';
+      for (const n of notes) {
+        const d = document.createElement('div');
+        d.className = 'ai-note ' + (n.kind === 'error' ? 'err' : n.kind === 'muted' ? 'muted' : 'ok');
+        d.textContent = n.text;
+        box.appendChild(d);
+      }
+      if (m.snapshotId && snapshots.has(m.snapshotId)) {
+        const b = document.createElement('button');
+        b.className = 'btn tiny';
+        b.dataset.rollback = m.snapshotId;
+        b.textContent = '回滚这次改动';
+        box.appendChild(b);
+      }
+      bubble.appendChild(box);
+    }
+
+    const meta = usageText(m);
+    if (meta) {
+      const d = document.createElement('div');
+      d.className = 'ai-meta';
+      d.textContent = meta;
+      bubble.appendChild(d);
+    }
+    return bubble;
+  }
+
   function messageEl(m, index) {
     const wrap = document.createElement('div');
     wrap.className = 'ai-msg ' + m.role;
     wrap.dataset.msg = String(index);
-
-    const bubble = document.createElement('div');
-    bubble.className = 'ai-bubble';
-
-    if (m.role === 'user') {
-      bubble.textContent = m.content;
-    } else {
-      const blocks = extractCodeBlocks(m.content);
-      const runs = m.runs || {};
-      const blockMeta = blocks.map((b, i) => {
-        const run = runs[i];
-        return {
-          runnable: b.runnable,
-          label: run ? (run.status === 'error' ? '重新运行' : '再运行一次') : '运行',
-        };
-      });
-      const md = document.createElement('div');
-      md.className = 'ai-md';
-      md.innerHTML = renderMarkdown(m.content || '…', { blockMeta });
-      bubble.appendChild(md);
-
-      const notes = [];
-      for (const [i, r] of Object.entries(runs).sort((a, b) => Number(a[0]) - Number(b[0]))) {
-        const prefix = Object.keys(runs).length > 1 ? `第 ${Number(i) + 1} 段：` : '';
-        notes.push({ kind: r.status, text: prefix + r.text });
-      }
-      if (m.logs?.length) notes.push({ kind: 'muted', text: 'console: ' + m.logs.map((l) => l.text).join(' | ') });
-      if (notes.length) {
-        const box = document.createElement('div');
-        box.className = 'ai-notes';
-        for (const n of notes) {
-          const d = document.createElement('div');
-          d.className = 'ai-note ' + (n.kind === 'error' ? 'err' : n.kind === 'muted' ? 'muted' : 'ok');
-          d.textContent = n.text;
-          box.appendChild(d);
-        }
-        if (m.snapshotId && snapshots.has(m.snapshotId)) {
-          const b = document.createElement('button');
-          b.className = 'btn tiny';
-          b.dataset.rollback = m.snapshotId;
-          b.textContent = '回滚这次改动';
-          box.appendChild(b);
-        }
-        bubble.appendChild(box);
-      }
-    }
-
-    wrap.appendChild(bubble);
+    wrap.appendChild(buildBubble(m));
     return wrap;
   }
 
@@ -216,10 +272,11 @@ export function initAiPanel(IC) {
     const wrap = $('ai-messages').querySelector(`.ai-msg[data-msg="${index}"]`);
     if (!wrap) return;
     wrap.classList.add('streaming');
-    const md = wrap.querySelector('.ai-md');
     const m = currentSession().messages[index];
-    const blocks = extractCodeBlocks(m.content);
-    md.innerHTML = renderMarkdown(m.content || '…', { blockMeta: blocks.map(() => ({ runnable: false })) });
+    const old = wrap.querySelector('.ai-bubble');
+    const next = buildBubble(m, { streaming: true });
+    if (old) wrap.replaceChild(next, old);
+    else wrap.appendChild(next);
     const box = $('ai-messages');
     box.scrollTop = box.scrollHeight;
   }
@@ -257,7 +314,8 @@ export function initAiPanel(IC) {
       if (res.result !== undefined && res.result !== null && res.result !== '') {
         text += ` · 返回 ${JSON.stringify(res.result)}`;
       }
-      m.runs[blockIndex] = { status: 'ok', text, at: Date.now() };
+      const wrote = (res.ops || []).some((op) => IC_WRITE_METHODS.includes(op.name));
+      m.runs[blockIndex] = { status: 'ok', text, at: Date.now(), wrote, seq: state.undoSeq };
     } else {
       m.runs[blockIndex] = {
         status: 'error',
@@ -283,6 +341,8 @@ export function initAiPanel(IC) {
     } catch (e) {
       toastHint('回滚失败：' + (e?.message || e));
     }
+    // 回滚后允许重跑（run.seq 与 undoSeq 不再相等）
+    state.undoSeq += 1;
     saveSessions();
     renderMessages();
   }
@@ -300,21 +360,28 @@ export function initAiPanel(IC) {
     }
 
     const s = currentSession();
-    s.messages.push({ id: id('m'), role: 'user', content: text, at: Date.now() });
+    let context = '';
+    if (state.settings.context !== false) {
+      try { context = buildContext(IC); } catch (e) { console.warn('[AI] 构造上下文失败', e); }
+    }
+    // 快照在发消息当刻就拼进 apiContent 存下来：历史消息内容此后不再变，prefix cache 才保得住
+    s.messages.push({
+      id: id('m'),
+      role: 'user',
+      content: text,
+      apiContent: composeUserContent(text, context),
+      at: Date.now(),
+    });
     s.updatedAt = Date.now();
     if (s.title === '新会话') { s.title = text.replace(/\s+/g, ' ').slice(0, 20); renderSessionList(); }
     input.value = '';
     renderMessages();
     saveSessions();
 
-    let context = '';
-    if (state.settings.context !== false) {
-      try { context = buildContext(IC); } catch (e) { console.warn('[AI] 构造上下文失败', e); }
-    }
-    const history = s.messages.map((m) => ({ role: m.role, content: m.content }));
-    const messages = [{ role: 'system', content: SYSTEM_PROMPT }, ...buildMessages({ history, context })];
+    const history = messagesToApi(s.messages);
+    const messages = buildMessages({ history, system: SYSTEM_PROMPT });
 
-    const assistant = { id: id('m'), role: 'assistant', content: '', at: Date.now() };
+    const assistant = { id: id('m'), role: 'assistant', content: '', reasoning: '', at: Date.now() };
     s.messages.push(assistant);
     const index = s.messages.length - 1;
     renderMessages();
@@ -323,20 +390,27 @@ export function initAiPanel(IC) {
     state.abort = new AbortController();
     setBusy(true);
     const provider = createProvider(() => state.settings);
+    const absorb = (r) => {
+      if (!r) return;
+      if (r.content) assistant.content = r.content;
+      if (r.reasoning) assistant.reasoning = r.reasoning;
+      if (r.usage) assistant.usage = r.usage;
+      if (typeof r.ttftMs === 'number') assistant.ttftMs = r.ttftMs;
+    };
     try {
       const useStream = state.settings.stream !== false;
       try {
-        await provider.chat(messages, {
+        absorb(await provider.chat(messages, {
           stream: useStream,
           signal: state.abort.signal,
           onDelta: (_d, full) => { assistant.content = full; updateStreamingBubble(index); },
-        });
+          onReasoning: (_d, full) => { assistant.reasoning = full; updateStreamingBubble(index); },
+        }));
       } catch (e) {
         const authFail = e instanceof ApiError && (e.status === 401 || e.status === 403);
         if (useStream && !authFail && !assistant.content && !state.abort.signal.aborted) {
           // 有些 endpoint 不支持流式，退化成一次性返回再试
-          const r = await provider.chat(messages, { stream: false, signal: state.abort.signal });
-          assistant.content = r.content;
+          absorb(await provider.chat(messages, { stream: false, signal: state.abort.signal }));
         } else {
           throw e;
         }
@@ -347,6 +421,7 @@ export function initAiPanel(IC) {
       const msg = e instanceof ApiError ? e.message : String(e?.message || e);
       assistant.content = (assistant.content ? assistant.content + '\n\n' : '') + `> ⚠️ 请求失败：${msg}`;
     } finally {
+      assistant.reasoningDone = true;
       state.busy = false;
       state.abort = null;
       setBusy(false);
@@ -356,11 +431,13 @@ export function initAiPanel(IC) {
       renderMessages();
     }
 
-    if (state.settings.autoRun) {
-      const blocks = extractCodeBlocks(assistant.content);
-      for (let i = 0; i < blocks.length; i++) {
-        if (blocks[i].runnable) await runBlock(index, i);
-      }
+    // 只读代码块无需确认（不受「自动执行」开关影响）；写代码块只有开了自动执行才自动跑。
+    // 被静态扫描拦下的代码不自动跑，留给用户自己点。
+    const blocks = extractCodeBlocks(assistant.content);
+    for (let i = 0; i < blocks.length; i++) {
+      if (!blocks[i].runnable) continue;
+      const readOnly = isReadOnlyCode(blocks[i].code) && !scanCode(blocks[i].code).blocked;
+      if (readOnly || state.settings.autoRun) await runBlock(index, i);
     }
   }
 
@@ -493,6 +570,12 @@ export function initAiPanel(IC) {
     }
     const rb = ev.target.closest('[data-rollback]');
     if (rb) rollback(rb.dataset.rollback);
+  });
+
+  // 网格里撤销/重做后，重新启用已执行过的「运行」按钮
+  document.addEventListener('ic:history', () => {
+    state.undoSeq += 1;
+    renderMessages();
   });
 
   const api = {

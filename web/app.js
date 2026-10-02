@@ -31,6 +31,8 @@ const rowHeadersInner = $('row-headers-inner');
 const rangeOverlay = $('range-overlay');
 const activeOverlay = $('active-overlay');
 const flashLayer = $('flash-layer');
+const textLayer = $('text-layer');
+const refOverlay = $('ref-overlay');
 const editorLayer = $('editor-layer');
 const tabList = $('tab-list');
 const fxInput = $('fx-input');
@@ -55,6 +57,13 @@ let cellPool = [];
 let flashBoxes = [];
 let flashTimer = null;
 
+// 文本单元格高亮 / 公式引用高亮 用的缓存
+let dataVersion = 0;          // 每次 invalidate() +1
+let textFlagKey = '';         // computeTextCells 的缓存键
+let textFlagRenderedKey = ''; // 已画到 DOM 的缓存键
+let textFlagCells = [];       // 最近一次算出的文本单元格
+let textFlagTruncated = false;
+
 // ---------------------------------------------------------------- utils
 function toast(msg, kind) {
   toastEl.textContent = msg;
@@ -66,6 +75,8 @@ function toast(msg, kind) {
 function invalidate() {
   if (cellCache.size > CACHE_LIMIT) cellCache = new Map();
   cellCache.clear();
+  dataVersion++;
+  textFlagKey = '';
 }
 
 function selRange() {
@@ -101,6 +112,7 @@ function buildMetrics() {
   }
   canvasEl.style.width = colX[GRID_COLS + 1] + 'px';
   canvasEl.style.height = GRID_ROWS * DEF_ROW_H + 'px';
+  textFlagRenderedKey = ''; // 列宽变了，文本标记要重画
 }
 
 function colWidth(c) {
@@ -159,7 +171,10 @@ function render() {
   renderColHeaders(c0, c1);
   renderRowHeaders(r0, r1);
   renderCells(r0, r1, c0, c1);
+  renderTextFlags();
   renderOverlays();
+  updateRefHighlight();
+  syncFormatToolbar();
   renderRef();
   renderStatus();
 }
@@ -224,6 +239,7 @@ function renderCells(r0, r1, c0, c1) {
       el.style.color = '';
       el.style.background = '#fff';
       el.style.fontSize = '';
+      el.style.textDecoration = '';
       el.textContent = '';
       el.dataset.r = r;
       el.dataset.c = c;
@@ -253,7 +269,10 @@ function applyStyle(el, st) {
   if (f) {
     if (f.b) el.classList.add('bold');
     if (f.i) el.classList.add('italic');
-    if (f.u) el.classList.add('underline');
+    const deco = [];
+    if (f.u) deco.push('underline');
+    if (f.strike) deco.push('line-through');
+    if (deco.length) el.style.textDecoration = deco.join(' ');
     const c = resolveColor(f.color);
     if (c) el.style.color = c;
     if (f.sz && Math.abs(f.sz - 11) > 0.01) el.style.fontSize = (f.sz * 1.333).toFixed(1) + 'px';
@@ -365,6 +384,222 @@ function opArea(op) {
   return null;
 }
 
+// ---------------- 格式工具栏（粗/斜/下划线/删除线/字号） ----------------
+function currentStyle() {
+  try { return model.getCellStyle(sheet, sel.ar, sel.ac)?.style || null; } catch { return null; }
+}
+
+function applyRangeStyle(path, value) {
+  model.updateRangeStyle(areaObj(selRange()), path, String(value));
+  invalidate();
+  render();
+}
+
+function toggleFontFlag(prop) {
+  const st = currentStyle();
+  applyRangeStyle('font.' + prop, !(st?.font?.[prop]));
+}
+
+function setFontSize(size) {
+  const n = Number(size);
+  if (!Number.isFinite(n) || n < 1) return;
+  applyRangeStyle('font.size', n);
+}
+
+/** 工具栏按钮回显当前单元格的样式。 */
+function syncFormatToolbar() {
+  const f = currentStyle()?.font || {};
+  $('btn-bold').classList.toggle('on', !!f.b);
+  $('btn-italic').classList.toggle('on', !!f.i);
+  $('btn-underline').classList.toggle('on', !!f.u);
+  $('btn-strike').classList.toggle('on', !!f.strike);
+  const el = $('font-size');
+  if (document.activeElement !== el) el.value = String(f.sz || 11);
+}
+
+// ---------------- 文本单元格高亮 + 一键转数字 ----------------
+/** 把「看着像数字的文本」清成数字（千分位/货币符号/百分号/括号负数）；做不到返回 null。 */
+function cleanNumericText(s) {
+  let t = String(s ?? '').trim();
+  if (!t) return null;
+  let neg = false;
+  if (/^\(.*\)$/.test(t)) { neg = true; t = t.slice(1, -1).trim(); }
+  t = t.replace(/[¥$€£₩\s\u00a0]/g, '');
+  let pct = false;
+  if (t.endsWith('%')) { pct = true; t = t.slice(0, -1); }
+  t = t.replace(/,/g, '');
+  if (!/^[-+]?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?$/.test(t)) return null;
+  let n = Number(t);
+  if (!Number.isFinite(n)) return null;
+  if (pct) n /= 100;
+  if (neg) n = -n;
+  return n;
+}
+
+/** 扫描当前工作表数据区里的文本单元格（带缓存，按 dataVersion/表/模式失效）。 */
+function computeTextCells() {
+  const onlyNum = $('chk-text-num').checked;
+  const key = `${dataVersion}:${sheet}:${onlyNum ? 'num' : 'all'}`;
+  if (textFlagKey === key) return textFlagCells;
+  const cells = [];
+  const CAP = 3000;
+  const SCAN_CAP = 200000;
+  let scanned = 0;
+  const u = usedRangeOf(sheet);
+  if (u) {
+    outer:
+    for (let r = u.r1; r <= u.r2; r++) {
+      for (let c = u.c1; c <= u.c2; c++) {
+        if (++scanned > SCAN_CAP || cells.length >= CAP) break outer;
+        let raw = '', type = 2, disp = '';
+        try {
+          raw = model.getCellContent(sheet, r, c);
+          type = model.getCellType(sheet, r, c);
+          if (type !== 2 || raw === '' || raw.startsWith('=')) continue;
+          disp = model.getFormattedCellValue(sheet, r, c);
+        } catch { continue; }
+        const num = cleanNumericText(disp);
+        if (onlyNum && num === null) continue;
+        cells.push({ r, c, raw, num });
+      }
+    }
+  }
+  textFlagTruncated = cells.length >= CAP || scanned > SCAN_CAP;
+  textFlagKey = key;
+  textFlagCells = cells;
+  return cells;
+}
+
+function renderTextFlags() {
+  if (!$('chk-text').checked) {
+    if (textLayer.childNodes.length) { textLayer.textContent = ''; textFlagRenderedKey = ''; }
+    updateNumifyButtons();
+    return;
+  }
+  const key = `${dataVersion}:${sheet}:${$('chk-text-num').checked ? 'num' : 'all'}`;
+  if (textFlagRenderedKey !== key) {
+    textLayer.textContent = '';
+    const frag = document.createDocumentFragment();
+    for (const { r, c } of computeTextCells()) {
+      const d = document.createElement('div');
+      d.className = 'text-flag';
+      d.style.left = colX[c] + 'px';
+      d.style.top = (r - 1) * DEF_ROW_H + 'px';
+      d.style.width = colWidth(c) + 'px';
+      d.style.height = DEF_ROW_H + 'px';
+      frag.appendChild(d);
+    }
+    textLayer.appendChild(frag);
+    textFlagRenderedKey = key;
+  }
+  updateNumifyButtons();
+}
+
+function selectionCandidates() {
+  const s = selRange();
+  if (s.r1 === s.r2 && s.c1 === s.c2) return [];
+  return computeTextCells().filter((x) => x.num !== null && x.r >= s.r1 && x.r <= s.r2 && x.c >= s.c1 && x.c <= s.c2);
+}
+
+function updateNumifyButtons() {
+  const on = $('chk-text').checked;
+  const allBtn = $('btn-numify-all');
+  const selBtn = $('btn-numify');
+  if (!on) { allBtn.disabled = true; selBtn.disabled = true; return; }
+  allBtn.disabled = !computeTextCells().some((x) => x.num !== null);
+  selBtn.disabled = selectionCandidates().length === 0;
+}
+
+/** 把「像数字的文本」转成真数字。scope: 'selection' | 'all' */
+function numify(scope) {
+  const s = selRange();
+  const single = s.r1 === s.r2 && s.c1 === s.c2;
+  const list = (scope === 'selection'
+    ? (single ? [] : computeTextCells().filter((x) => x.num !== null && x.r >= s.r1 && x.r <= s.r2 && x.c >= s.c1 && x.c <= s.c2))
+    : computeTextCells().filter((x) => x.num !== null));
+  if (!list.length) { toast('没有可转换的文本数字'); return; }
+  let done = 0, failed = 0;
+  try {
+    model.pauseEvaluation();
+    for (const x of list) {
+      try {
+        // 文本格式会把数字顶回去，先清成 general
+        let fmt = '';
+        try { fmt = model.getCellStyle(sheet, x.r, x.c)?.style?.num_fmt || ''; } catch { /* ignore */ }
+        if (fmt.replace(/"/g, '').trim() === '@') {
+          model.updateRangeStyle({ sheet, row: x.r, column: x.c, width: 1, height: 1 }, 'num_fmt', 'general');
+        }
+        model.setUserInput(sheet, x.r, x.c, x.raw);
+        if (model.getCellType(sheet, x.r, x.c) === 1) { done++; continue; }
+        // 引擎认不出来（比如 ¥88），用本地清洗后的数字兑底
+        model.setUserInput(sheet, x.r, x.c, String(x.num));
+        if (model.getCellType(sheet, x.r, x.c) === 1) done++; else failed++;
+      } catch { failed++; }
+    }
+  } finally {
+    model.resumeEvaluation();
+    model.evaluate();
+  }
+  invalidate();
+  render();
+  toast(`已转换 ${done} 个${failed ? `，${failed} 个失败` : ''}（${scope === 'all' ? '整表' : '选区'}）`);
+}
+
+// ---------------- 编辑公式时高亮光标所在的引用（Excel 式） ----------------
+const REF_TOKEN_RE = /(?:(?:'[^']*'|[A-Za-z_][A-Za-z0-9_.]*)!)?(?:\$?[A-Za-z]{1,3}\$?\d+(?::\$?[A-Za-z]{1,3}\$?\d+)?|\$?[A-Za-z]{1,3}:\$?[A-Za-z]{1,3}|\$?\d+:\$?\d+)/g;
+
+/** 找出公式文本里包含 pos 的那个 A1 引用 token（排除函数名）。 */
+function refTokenAt(text, pos) {
+  REF_TOKEN_RE.lastIndex = 0;
+  let m;
+  while ((m = REF_TOKEN_RE.exec(text))) {
+    const start = m.index, end = start + m[0].length;
+    if (start > pos) break;
+    if (pos < start || pos > end) continue;
+    const prev = text[start - 1] || '';
+    const next = text[end] || '';
+    if (/[A-Za-z0-9_.$']/.test(prev)) continue;
+    if (next === '(') continue; // 函数名，不是引用
+    if (/[A-Za-z0-9_.$]/.test(next)) continue;
+    return m[0];
+  }
+  return null;
+}
+
+function hideRefHighlight() {
+  refOverlay.classList.add('hidden');
+}
+
+function editingInput() {
+  if (editing && document.activeElement === editing.el) return editing.el;
+  if (document.activeElement === fxInput) return fxInput;
+  return null;
+}
+
+function updateRefHighlight() {
+  const el = editingInput();
+  if (!el || !el.value.startsWith('=')) { hideRefHighlight(); return; }
+  const token = refTokenAt(el.value, el.selectionStart ?? el.value.length);
+  if (!token) { hideRefHighlight(); return; }
+  let a;
+  try { a = parseRef(token); } catch { hideRefHighlight(); return; }
+  if (a.sheet !== sheet) { hideRefHighlight(); return; }
+  const r1 = Math.max(1, Math.min(GRID_ROWS, Math.min(a.r1, a.r2)));
+  const r2 = Math.max(1, Math.min(GRID_ROWS, Math.max(a.r1, a.r2)));
+  const c1 = Math.max(1, Math.min(GRID_COLS, Math.min(a.c1, a.c2)));
+  const c2 = Math.max(1, Math.min(GRID_COLS, Math.max(a.c1, a.c2)));
+  refOverlay.classList.remove('hidden');
+  refOverlay.style.left = colX[c1] + 'px';
+  refOverlay.style.top = (r1 - 1) * DEF_ROW_H + 'px';
+  refOverlay.style.width = (colX[c2 + 1] - colX[c1]) + 'px';
+  refOverlay.style.height = (r2 - r1 + 1) * DEF_ROW_H + 'px';
+}
+
+/** 撤销/重做后通知 AI 面板：已执行过的写操作按钮重新可点。 */
+function notifyHistory() {
+  try { document.dispatchEvent(new CustomEvent('ic:history')); } catch { /* ignore */ }
+}
+
 function renderOverlays() {
   const s = selRange();
   const x = colX[s.c1];
@@ -416,21 +651,33 @@ function parseNum(s) {
 }
 
 function renderStatus() {
+  const parts = [];
   const s = selRange();
   const n = (s.r2 - s.r1 + 1) * (s.c2 - s.c1 + 1);
-  if (n <= 1 || n > 2000) { statusEl.textContent = ''; return; }
-  let sum = 0, count = 0;
-  for (let r = s.r1; r <= s.r2; r++) {
-    for (let c = s.c1; c <= s.c2; c++) {
-      const { text } = getCell(r, c);
-      const v = parseNum(text);
-      if (v !== null && Number.isFinite(v)) { sum += v; count++; }
+  if (n > 1 && n <= 2000) {
+    let sum = 0, count = 0;
+    for (let r = s.r1; r <= s.r2; r++) {
+      for (let c = s.c1; c <= s.c2; c++) {
+        const { text } = getCell(r, c);
+        const v = parseNum(text);
+        if (v !== null && Number.isFinite(v)) { sum += v; count++; }
+      }
+    }
+    if (count) {
+      const avg = sum / count;
+      const fmt = (v) => (Math.round(v * 1e6) / 1e6).toLocaleString('en-US');
+      parts.push(`求和: ${fmt(sum)}　平均: ${fmt(avg)}　数值个数: ${count}`);
     }
   }
-  if (!count) { statusEl.textContent = ''; return; }
-  const avg = sum / count;
-  const fmt = (v) => (Math.round(v * 1e6) / 1e6).toLocaleString('en-US');
-  statusEl.textContent = `求和: ${fmt(sum)}　平均: ${fmt(avg)}　数值个数: ${count}`;
+  if ($('chk-text').checked) {
+    const cells = computeTextCells();
+    const num = cells.filter((x) => x.num !== null).length;
+    parts.push($('chk-text-num').checked
+      ? `文本数字: ${num}`
+      : `文本单元格: ${cells.length}（像数字 ${num}）`);
+    if (textFlagTruncated) parts.push('（只统计前 3000 个）');
+  }
+  statusEl.textContent = parts.join('　|　');
 }
 
 // ---------------------------------------------------------------- tabs
@@ -568,7 +815,14 @@ function startEdit(initial) {
     else if (ev.key === 'Tab') { ev.preventDefault(); commitEdit({ dr: 0, dc: ev.shiftKey ? -1 : 1 }); }
     else if (ev.key === 'Escape') { ev.preventDefault(); cancelEdit(); }
   });
-  el.addEventListener('blur', () => { if (editing && editing.el === el) commitEdit(null); });
+  el.addEventListener('input', updateRefHighlight);
+  el.addEventListener('click', updateRefHighlight);
+  el.addEventListener('keyup', updateRefHighlight);
+  el.addEventListener('select', updateRefHighlight);
+  el.addEventListener('blur', () => {
+    hideRefHighlight();
+    if (editing && editing.el === el) commitEdit(null);
+  });
 
   el.focus();
   el.setSelectionRange(el.value.length, el.value.length);
@@ -579,6 +833,7 @@ function commitEdit(move) {
   const ed = editing;
   editing = null;
   pick = null;
+  hideRefHighlight();
   const value = ed.el.value;
   ed.el.remove();
   if (value !== ed.original) {
@@ -599,6 +854,7 @@ function cancelEdit() {
   const ed = editing;
   editing = null;
   pick = null;
+  hideRefHighlight();
   ed.el.remove();
   focusGrid();
   render();
@@ -669,15 +925,18 @@ scrollEl.addEventListener('keydown', (ev) => {
   if (ctrl && (key === 'z' || key === 'Z')) {
     ev.preventDefault();
     try { ev.shiftKey ? model.redo() : model.undo(); } catch { /* ignore */ }
-    invalidate(); render(); updateUndoButtons();
+    invalidate(); render(); updateUndoButtons(); notifyHistory();
     return;
   }
   if (ctrl && (key === 'y' || key === 'Y')) {
     ev.preventDefault();
     try { model.redo(); } catch { /* ignore */ }
-    invalidate(); render(); updateUndoButtons();
+    invalidate(); render(); updateUndoButtons(); notifyHistory();
     return;
   }
+  if (ctrl && (key === 'b' || key === 'B')) { ev.preventDefault(); toggleFontFlag('b'); return; }
+  if (ctrl && (key === 'i' || key === 'I')) { ev.preventDefault(); toggleFontFlag('i'); return; }
+  if (ctrl && (key === 'u' || key === 'U')) { ev.preventDefault(); toggleFontFlag('u'); return; }
   if (ctrl && (key === 'a' || key === 'A')) { ev.preventDefault(); selectAll(); return; }
   if (ctrl && (key === 'c' || key === 'C' || key === 'x' || key === 'X')) {
     // 交给 copy/cut 事件处理
@@ -880,13 +1139,30 @@ fxInput.addEventListener('keydown', (ev) => {
   }
 });
 
+fxInput.addEventListener('input', updateRefHighlight);
+fxInput.addEventListener('click', updateRefHighlight);
+fxInput.addEventListener('keyup', updateRefHighlight);
+fxInput.addEventListener('select', updateRefHighlight);
+fxInput.addEventListener('blur', hideRefHighlight);
+
 // ---------------------------------------------------------------- toolbar
 $('btn-new').onclick = () => newWorkbook();
 $('btn-open').onclick = () => $('file-input').click();
 $('btn-save').onclick = () => saveXlsx();
-$('btn-undo').onclick = () => { try { model.undo(); } catch { /* ignore */ } invalidate(); render(); updateUndoButtons(); };
-$('btn-redo').onclick = () => { try { model.redo(); } catch { /* ignore */ } invalidate(); render(); updateUndoButtons(); };
+$('btn-undo').onclick = () => { try { model.undo(); } catch { /* ignore */ } invalidate(); render(); updateUndoButtons(); notifyHistory(); };
+$('btn-redo').onclick = () => { try { model.redo(); } catch { /* ignore */ } invalidate(); render(); updateUndoButtons(); notifyHistory(); };
 $('chk-grid').onchange = () => render();
+// 格式工具栏
+$('btn-bold').onclick = () => toggleFontFlag('b');
+$('btn-italic').onclick = () => toggleFontFlag('i');
+$('btn-underline').onclick = () => toggleFontFlag('u');
+$('btn-strike').onclick = () => toggleFontFlag('strike');
+$('font-size').onchange = (ev) => setFontSize(ev.target.value);
+// 文本单元格高亮 / 转数字
+$('chk-text').onchange = () => { textFlagKey = ''; textFlagRenderedKey = ''; render(); };
+$('chk-text-num').onchange = () => { textFlagKey = ''; textFlagRenderedKey = ''; render(); };
+$('btn-numify').onclick = () => numify('selection');
+$('btn-numify-all').onclick = () => numify('all');
 $('btn-add-sheet').onclick = () => {
   try { model.newSheet(); } catch (e) { toast(e, 'error'); return; }
   selectSheet(model.getWorksheetsProperties().length - 1);
@@ -1280,8 +1556,8 @@ const IC = {
   },
 
   // ---- 撤销 / 文件 ----
-  undo() { model.undo(); invalidate(); render(); updateUndoButtons(); return model.canUndo(); },
-  redo() { model.redo(); invalidate(); render(); updateUndoButtons(); return model.canRedo(); },
+  undo() { model.undo(); invalidate(); render(); updateUndoButtons(); notifyHistory(); return model.canUndo(); },
+  redo() { model.redo(); invalidate(); render(); updateUndoButtons(); notifyHistory(); return model.canRedo(); },
   canUndo: () => { try { return model.canUndo(); } catch { return false; } },
   canRedo: () => { try { return model.canRedo(); } catch { return false; } },
   toXlsx: () => model.toXlsx(),

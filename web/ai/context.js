@@ -79,18 +79,54 @@ function col(n) {
   return s || 'A';
 }
 
-/** 组装发给模型的消息数组（system + 上下文 + 历史）。 */
-export function buildMessages({ history = [], context = '', maxHistory = 20 } = {}) {
+/** 把当轮快照拼进用户消息内容——这样历史消息数组只追加、不改写，prefix cache 才保得住。 */
+export function composeUserContent(text, context = '') {
+  const t = String(text ?? '');
+  if (!context) return t;
+  return `【当前工作簿快照】\n${context}\n---\n\n${t}`;
+}
+
+/**
+ * 把会话消息转成发给模型的 messages。
+ *
+ * 关键：**只追加、不改写**。
+ *   - 用户消息用 `apiContent`（发消息当刻就存好的「快照 + 原文」），没有则退回 content。
+ *   - assistant 消息后面追加一条合成的 user 消息，把那次代码执行结果回传给模型；
+ *     结果是从 `m.runs` 确定性推导出来的，所以同一段历史每轮拼出来都一样。
+ * 这样第 N 轮的消息数组是第 N+1 轮的前缀，服务端的 prefix cache 能命中。
+ */
+export function messagesToApi(messages = [], { max = 80 } = {}) {
+  const out = [];
+  const list = messages.slice(-max);
+  for (const m of list) {
+    if (!m || (m.role !== 'user' && m.role !== 'assistant')) continue;
+    const content = m.apiContent ?? m.content;
+    if (!content) continue;
+    out.push({ role: m.role, content });
+    if (m.role === 'assistant' && m.runs && Object.keys(m.runs).length) {
+      const lines = [];
+      for (const key of Object.keys(m.runs).sort((a, b) => Number(a) - Number(b))) {
+        const r = m.runs[key];
+        if (r?.text) lines.push(r.text);
+      }
+      if (m.logs?.length) lines.push('console: ' + m.logs.map((l) => l.text).join(' | '));
+      if (lines.length) out.push({ role: 'user', content: `【代码执行结果】\n${lines.join('\n')}` });
+    }
+  }
+  return out;
+}
+
+/**
+ * 组装发给模型的消息数组（system + 历史）。
+ * history 已经是可以直接发的 { role, content }（由 messagesToApi 生成，或测试里手写）。
+ */
+export function buildMessages({ history = [], system = '', maxHistory = 80 } = {}) {
   const msgs = [];
+  if (system) msgs.push({ role: 'system', content: system });
   for (const m of history.slice(-maxHistory)) {
     if (!m || !m.content) continue;
     if (m.role !== 'user' && m.role !== 'assistant') continue;
     msgs.push({ role: m.role, content: m.content });
-  }
-  if (context) {
-    // 插到最后一条 user 消息之前，这样上下文总是「最新」的
-    const insertAt = msgs.length && msgs[msgs.length - 1].role === 'user' ? msgs.length - 1 : msgs.length;
-    msgs.splice(insertAt, 0, { role: 'system', content: `【当前工作簿快照】\n${context}` });
   }
   return msgs;
 }

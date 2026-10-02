@@ -74,15 +74,39 @@ function briefBody(text) {
   return s.length > 2000 ? s.slice(0, 2000) + '…' : s;
 }
 
-async function readSse(res, onDelta, signal) {
+function nowMs() {
+  return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+}
+
+/**
+ * 各家推理内容字段不统一，这里都认：DeepSeek 用 delta.reasoning_content，
+ * 有些 OpenAI 兼容服务用 delta.reasoning，非流式则是 message.reasoning_content。
+ */
+function reasoningOf(obj) {
+  if (!obj || typeof obj !== 'object') return '';
+  const v = obj.reasoning_content ?? obj.reasoning;
+  return typeof v === 'string' ? v : '';
+}
+
+async function readSse(res, opts, signal) {
   if (!res.body || typeof res.body.getReader !== 'function') {
     throw new ApiError('该 endpoint 的流式响应无法读取（没有 response body）', { status: res.status });
   }
+  const { onDelta, onReasoning, startedAt } = opts || {};
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buf = '';
   let content = '';
+  let reasoning = '';
+  let usage = null;
+  let ttftMs = null;
   let finished = false;
+
+  const markFirst = () => {
+    if (ttftMs === null && typeof startedAt === 'number') {
+      ttftMs = Math.max(0, nowMs() - startedAt);
+    }
+  };
 
   const handleLine = (line) => {
     const trimmed = line.replace(/\r$/, '');
@@ -93,10 +117,19 @@ async function readSse(res, onDelta, signal) {
     let json;
     try { json = JSON.parse(data); } catch { return false; }
     if (json?.error) throw new ApiError(describeErrorBody(0, JSON.stringify(json)), { body: JSON.stringify(json) });
+    // DeepSeek 把 usage 放在最后一个 chunk 的顶层（需请求里带 stream_options.include_usage）
+    if (json?.usage) usage = json.usage;
     const choice = json?.choices?.[0];
+    const rdelta = reasoningOf(choice?.delta) || reasoningOf(choice?.message);
     const delta = choice?.delta?.content ?? choice?.message?.content;
+    if (rdelta) {
+      reasoning += rdelta;
+      markFirst();
+      onReasoning?.(rdelta, reasoning);
+    }
     if (delta) {
       content += delta;
+      markFirst();
       onDelta?.(delta, content);
     }
     return false;
@@ -114,7 +147,7 @@ async function readSse(res, onDelta, signal) {
       if (handleLine(line)) { finished = true; break; }
     }
   }
-  return { content };
+  return { content, reasoning, usage, ttftMs };
 }
 
 /** 把外部 signal 与超时合成一个 signal，返回 { signal, timedOut, cleanup }。 */
@@ -165,8 +198,11 @@ export function createProvider(config = {}) {
 
   /**
    * 发一句话，拿回复。
-   * opts: { stream, onDelta, signal, model, temperature, messages }
-   * 返回 { content, usage, raw, streamed }
+   * opts: { stream, onDelta, onReasoning, signal, model, temperature, messages }
+   * 返回 { content, reasoning, usage, ttftMs, raw, streamed }
+   *   - reasoning: 推理内容（DeepSeek reasoning_content / 部分兼容实现的 reasoning），没有则 null
+   *   - usage: 服务端 token 统计，没有则 null
+   *   - ttftMs: 从发请求到第一个 delta 的毫秒数（非流式则为整个响应耗时）
    */
   async function chat(messages, opts = {}) {
     const c = readConfig();
@@ -180,12 +216,18 @@ export function createProvider(config = {}) {
       messages,
       stream: !!opts.stream,
     };
+    // 让服务端在流式响应的最后一个 chunk 里带 usage（OpenAI / DeepSeek 都支持）。
+    // 不支持的端点会忽略未知字段；也可用 opts.streamOptions 关掉。
+    if (body.stream && opts.streamOptions !== false && c.streamOptions !== false) {
+      body.stream_options = { include_usage: true };
+    }
     const temperature = opts.temperature ?? c.temperature;
     if (temperature !== undefined && temperature !== null && temperature !== '') {
       body.temperature = Number(temperature);
     }
 
     const link = linkAbort(opts.signal, opts.timeoutMs ?? c.timeoutMs);
+    const startedAt = nowMs();
     try {
       let res;
       try {
@@ -213,21 +255,36 @@ export function createProvider(config = {}) {
       const isStream = body.stream && res.body;
       if (isStream) {
         // 流式读取时的超时/取消也要归一成 ApiError
-        let content;
+        let out;
         try {
-          ({ content } = await readSse(res, opts.onDelta, link.signal));
+          out = await readSse(res, { onDelta: opts.onDelta, onReasoning: opts.onReasoning, startedAt }, link.signal);
         } catch (e) {
           if (e instanceof ApiError) throw e;
           if (link.isTimeout()) throw new ApiError('请求超时（流式响应中途断了）', { url });
           if (e?.name === 'AbortError' || opts.signal?.aborted) throw new ApiError('请求已取消', { url });
           throw new ApiError(`流式读取失败：${e?.message || e}`, { url });
         }
-        return { content, usage: null, raw: null, streamed: true };
+        return {
+          content: out.content,
+          reasoning: out.reasoning || null,
+          usage: out.usage,
+          ttftMs: out.ttftMs,
+          raw: null,
+          streamed: true,
+        };
       }
 
       const json = await res.json();
-      const content = json?.choices?.[0]?.message?.content ?? '';
-      return { content: typeof content === 'string' ? content : String(content ?? ''), usage: json?.usage ?? null, raw: json, streamed: false };
+      const message = json?.choices?.[0]?.message ?? {};
+      const content = message.content ?? '';
+      return {
+        content: typeof content === 'string' ? content : String(content ?? ''),
+        reasoning: reasoningOf(message) || null,
+        usage: json?.usage ?? null,
+        ttftMs: nowMs() - startedAt,
+        raw: json,
+        streamed: false,
+      };
     } finally {
       link.cleanup();
     }
