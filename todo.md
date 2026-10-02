@@ -84,8 +84,9 @@
 
 - 自动执行好像不会触发高亮动画？bug 待排查
 
---- 3
 
+--- 3
+- 顶部编辑单元格的大横框 左侧 类似excel加上 勾叉按钮  点击叉的话放弃提交，点击勾 或者回车 或者焦点点出来则保持提交
 - 只读操作 不用展示 回滚改动按钮？
 - llm 一次操作可能会有多次读查询，不应该在一次读完之后就终止会话
 J 列有几个合计数字应该是公式但现在是手算的，帮我找出来是什么格子
@@ -141,7 +142,14 @@ return out.join('\n');
 
 
 
-- 单元格点击加粗 console error；其他的格式调整也是这样
+- ✅ 单元格点击加粗 console error（已修）：根因是 `selRange()` 没带 `sheet`，
+  `areaObj()` 传了 `sheet: undefined` 给 wasm → `invalid type: unit value, expected u32`。
+  现在 `selRange()` 带上当前 `sheet`，粗/斜/下划线/字号/颜色都不再报错。
+
+- ✅ 新增文字颜色 / 单元格背景色（工具栏 `A` + 方块两个按钮，预设色板 + 自定义取色 +
+  自动/无填充）；「文本数字」按钮改名为「文本/数字转换 ▾」，菜单项改为「选区转数字 / 整表转数字」。
+
+原始报错：
 ironcalc.js:1604 Uncaught Error: Error: invalid type: unit value, expected u32
     at __wbg_Error_92b29b0548f8b746 (ironcalc.js:1604:25)
     at wasm.wasm.wasm_bindgen[796926cdf6841328]::__wbindgen_error_new::__wbg_Error_92b29b0548f8b746 externref shim (ironcalc_bg.wasm:0x4253df)
