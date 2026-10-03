@@ -84,3 +84,5 @@
 
 - 自动执行好像不会触发高亮动画？bug 待排查
 
+- 点了选区转数字 ctrl-z 的时候是一个个回退的 而不是一次整个范围回退
+- 现在好像llm是 inline code block，但是对agent 应该用原生 tool call？例如 run_script?
