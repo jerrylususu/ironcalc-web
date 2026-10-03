@@ -97,28 +97,36 @@ scripts/mock-api.sh          # ==> http://127.0.0.1:8766/v1
 
 | 能力 | 说明 |
 | --- | --- |
-| 对话框 | 右侧面板（工具栏 **✦ AI** 开关），支持 markdown / 代码块 / 流式逐字上屏 |
+| 对话框 | 右侧面板（工具栏 **✦ AI** 开关），支持 markdown / 工具调用卡片 / 代码块 / 流式逐字上屏 |
 | endpoint + api key + model | ⚙ 里配置，存在 localStorage；「测试连接」走 `GET /models` |
-| provider 抽象 | `web/ai/provider.js`：OpenAI 兼容，流式 SSE + 非流式、超时、取消、401/500 归一化 |
+| provider 抽象 | `web/ai/provider.js`：OpenAI 兼容，流式 SSE + 非流式、**原生 tool calls**、超时、取消、401/500 归一化 |
 | 会话 | 多会话列表（localStorage 持久化）、新建 / 切换 / 删除，最近 80 条消息 |
-| 看懂表 | 每次请求把当前工作簿压成一段紧凑文本（表名 / 选区 / used range 的 TSV，公式保留原文）塞进 system 消息 |
-| 执行 | 模型输出 ```js 代码块 → 点「运行」或开「自动执行」→ 白名单沙箱里执行 `IC.*` |
+| 看懂表 | 每次请求把当前工作簿压成一段紧凑文本（表名 / 选区 / used range 的 TSV，公式保留原文）塞进用户消息 |
+| 原生工具调用（默认） | 模型调用 `run_script({ intent, code })` → 沙箱执行 `IC.*` → 结果作为 `role:'tool'` 消息回传 → 模型继续，直到给出最终回答 |
+| 执行 | 只读调用自动跑；写操作点卡片上的「运行」或开「自动执行」→ 白名单沙箱里执行 `IC.*` |
 | 回滚 | 一次 AI 改动前自动存 xlsx 快照，「回滚这次改动」一键还原（快照只在本次页面会话内有效） |
-| 多步骤 | 一条回复里多个代码块，可分别运行；执行结果（成功了哪些调用 / 报错在哪一步）显示在消息下面 |
+| 多步骤 | 一条回复里多个工具调用 / 代码块，可分别运行；执行结果（成功了哪些调用 / 报错在哪一步）显示在消息下面 |
 
 设计意图：**不把表格状态序列化给模型去“规划 API 调用”，而是让模型直接写调用 `IC.*` 的 JS**。
 `IC` 是页面上的一个窄接口（行列 1-based，也接受 A1 写法），模型只要会写 JS 就能改表。
+调用方式有两套，共用同一个沙箱：默认走**原生 tool call**（`run_script`），endpoint 不支持 tools
+（返回 400/404/422）时自动退回**正文代码块**模式（⚙ 里也能手动关掉工具调用）。
 
-### AI 的执行流程
+### AI 的执行流程（原生 tool call）
 
 ```
 输入问题
-  → buildContext(IC)          # 当前表快照（used range → TSV）
-  → POST {base}/chat/completions（流式）
-  → 解析出 ```js 代码块
-  → runAiCode(code, IC)       # 静态扫描 + new Function + 白名单注入
+  → buildContext(IC)                       # 当前表快照（used range → TSV）
+  → POST {base}/chat/completions  (stream, tools:[run_script])
+  → 流式拼接 delta.tool_calls → run_script({ intent, code })
+  → runAiCode(code, IC)                    # 静态扫描 + new Function + 白名单注入
   → IC.* 改 wasm model → 引擎重算 → 网格刷新
+  → 结果作为 { role:'tool', tool_call_id, content } 回传
+  → 模型继续下一轮（可能再调工具，或给出最终文本）
 ```
+
+代码块模式只是把上面第 2~4 步换成「解析正文里的 ```js 代码块 → 执行 → 作为合成 user 消息回传」，
+其余（快照/回滚、diff、高亮、只读免确认）完全一致。
 
 ### 安全边界（重要）
 
@@ -131,7 +139,8 @@ scripts/mock-api.sh          # ==> http://127.0.0.1:8766/v1
 - 写操作限于「表格 + 样式 + 工作表结构」，`IC.fromXlsx` / `IC.download` 这类破坏性或触发下载的方法**不在白名单里**。
 
 但它跑在同一个 realm，**模型仍能写出死循环卡住页面**。要跑真正不可信的代码得挪到 Web Worker 里加超时终止。
-另外：默认不自动执行，代码块要你点「运行」；执行前有 xlsx 快照可以回滚。
+另外：默认不自动执行写操作，工具调用 / 代码块要你点「运行」；执行前有 xlsx 快照可以回滚。
+原生工具调用的工具定义在 `web/ai/tools.js`（目前只有一个 `run_script`）。
 
 ### 给 AI 用的 IC API
 
@@ -179,10 +188,11 @@ IC.undo() IC.redo() IC.toast('…')
 │   ├── app.js             # 表格：渲染 / 交互 / 文件 IO / window.IC
 │   ├── refs.js            # A1 引用解析与生成（纯函数，可单测）
 │   ├── ai/
-│   │   ├── provider.js    # OpenAI 兼容 chat client（流式/非流式/超时/取消）
+│   │   ├── provider.js    # OpenAI 兼容 chat client（流式/非流式/tool calls/超时/取消）
 │   │   ├── sandbox.js     # 白名单 + new Function 执行模型写的 JS
-│   │   ├── context.js     # 工作簿 → prompt 文本；消息组装
-│   │   ├── prompt.js      # system prompt + IC API 文档
+│   │   ├── context.js     # 工作簿 → prompt 文本；消息组装（含 tool_calls/tool 结果）
+│   │   ├── prompt.js      # system prompt（工具模式 / 代码块模式）+ IC API 文档
+│   │   ├── tools.js       # 原生工具定义（run_script）与参数解析
 │   │   ├── markdown.js    # 极简 markdown / 代码块解析（纯函数）
 │   │   └── panel.js       # 对话框 UI：会话 / 设置 / 流式 / 执行 / 回滚
 │   └── pkg/               # wasm-bindgen 产物（构建生成，可重新生成）

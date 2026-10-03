@@ -10,8 +10,9 @@
 import { createProvider, ApiError, normalizeBaseUrl } from './provider.js';
 import { runAiCode, IC_WHITELIST, IC_WRITE_METHODS, summarizeOps, isReadOnlyCode, scanCode } from './sandbox.js';
 import { buildContext, buildMessages, composeUserContent, messagesToApi } from './context.js';
-import { SYSTEM_PROMPT } from './prompt.js';
-import { extractCodeBlocks, renderMarkdown } from './markdown.js';
+import { systemPromptFor } from './prompt.js';
+import { extractCodeBlocks, renderMarkdown, escapeHtml } from './markdown.js';
+import { TOOLS, TOOL_NAME, toStoredToolCall } from './tools.js';
 
 const LS_SETTINGS = 'ironcalc.ai.settings.v1';
 const LS_SESSIONS = 'ironcalc.ai.sessions.v1';
@@ -27,7 +28,8 @@ const WELCOME = [
   '- `在 B5 写合计公式，并把表头加粗居中`',
   '- `新建一个「汇总」表，把 Sheet1 的 A1:D5 抄过去`',
   '',
-  '点我给的代码块上的「运行」才会真正改表（也可以在下面勾「自动执行」）。',
+  '默认走原生 tool call：模型调用 `run_script` 来改表，执行结果会自动回传，' +
+    '只读的调用直接跑，写操作等你点一下卡片上的「运行」（或在下面勾「自动执行」）。',
   '右上角 ⚙ 配置 endpoint / api key / model；本地可以跑 `scripts/mock-api.sh` 起个假服务试。',
 ].join('\n');
 
@@ -45,6 +47,7 @@ export function initAiPanel(IC) {
       temperature: '',
       context: true,
       stream: true,
+      tools: true,
       autoRun: false,
     }),
     sessions: [],
@@ -99,6 +102,9 @@ export function initAiPanel(IC) {
           usage: m.usage || undefined,
           ttftMs: m.ttftMs,
           at: m.at,
+          toolCalls: m.toolCalls
+            ? m.toolCalls.map((tc) => ({ id: tc.id, name: tc.name, raw: tc.raw, args: tc.args, parseError: tc.parseError }))
+            : undefined,
           runs: m.runs
             ? Object.fromEntries(Object.entries(m.runs).map(([k, v]) => [k, {
               status: v.status, text: v.text, at: v.at, wrote: v.wrote, seq: v.seq,
@@ -177,6 +183,48 @@ export function initAiPanel(IC) {
     return n >= 1000 ? (n / 1000).toFixed(1) + 'k' : String(n);
   }
 
+  /**
+   * 一条 assistant 消息里「可以执行的东西」：
+   *   - 原生 tool call：每个 run_script 调用是一段代码；
+   *   - 代码块模式：正文里抽出来的 ```js 块。
+   * 两者的 run 结果都存在 m.runs[下标] 里，UI / 执行逻辑共用。
+   */
+  function actionsOf(m) {
+    if (Array.isArray(m?.toolCalls) && m.toolCalls.length) {
+      return m.toolCalls.map((tc) => ({
+        tool: true,
+        name: tc.name || 'tool',
+        code: typeof tc.args?.code === 'string' ? tc.args.code : '',
+        intent: typeof tc.args?.intent === 'string' ? tc.args.intent : '',
+        parseError: tc.parseError,
+        runnable: tc.name === TOOL_NAME && typeof tc.args?.code === 'string' && !tc.parseError,
+      }));
+    }
+    return extractCodeBlocks(m?.content).map((b) => ({ ...b, tool: false }));
+  }
+
+  /** 这条消息里没跑过、且能跑的 action 是否还有。（tool 模式下用来判断要不要继续 agent 循环） */
+  function allToolCallsResolved(m) {
+    if (!m?.toolCalls?.length) return false;
+    return m.toolCalls.every((_tc, i) => !!m.runs?.[i]);
+  }
+
+  /** 把原生 tool call 渲染成和代码块一样外观的卡片（.ai-code / .ai-run，事件绑定复用）。 */
+  function renderToolCalls(calls, metas) {
+    return calls.map((tc, i) => {
+      const meta = metas[i] || {};
+      const dis = meta.disabled ? ' disabled' : '';
+      const code = typeof tc.args?.code === 'string' ? tc.args.code : (tc.raw || '');
+      const intent = tc.parseError
+        ? `<div class="ai-tool-intent err">参数解析失败：${escapeHtml(tc.parseError)}</div>`
+        : (tc.args?.intent ? `<div class="ai-tool-intent">${escapeHtml(tc.args.intent)}</div>` : '');
+      const head = `<div class="ai-code-head"><span class="ai-lang">${escapeHtml(tc.name || 'tool')}</span>` +
+        `<button class="ai-run" data-block="${i}"${dis}>${escapeHtml(meta.label || '运行')}</button></div>`;
+      return `<div class="ai-code ai-tool" data-tool="${escapeHtml(tc.name || '')}" data-block="${i}">` +
+        intent + head + `<pre><code>${escapeHtml(code)}</code></pre></div>`;
+    }).join('');
+  }
+
   /** diff 里单元格值的短展示（空值/太长做处理）。 */
   function diffText(v) {
     const s = v === null || v === undefined ? '' : String(v);
@@ -219,23 +267,31 @@ export function initAiPanel(IC) {
       bubble.appendChild(d);
     }
 
-    const blocks = extractCodeBlocks(m.content);
+    const acts = actionsOf(m);
     const runs = m.runs || {};
     // 只有真正写过工作簿的消息才给「回滚这次改动」；纯读/纯计算的执行不留快照、也不该出现这个按钮。
     const anyWrote = Object.values(runs).some((r) => r?.wrote);
-    const blockMeta = blocks.map((b, i) => {
+    const blockMeta = acts.map((b, i) => {
       const run = runs[i];
       const disabled = runDisabled(run);
       let label = '运行';
       if (disabled) label = '已执行';
       else if (run?.status === 'error') label = '重新运行';
       else if (run) label = '再运行一次';
-      else if (b.runnable && isReadOnlyCode(b.code)) label = '只读 · 自动运行';
+      else if (b.runnable && isReadOnlyCode(b.code || '') && !scanCode(b.code || '').blocked) label = '只读 · 自动运行';
       return { runnable: b.runnable, label, disabled };
     });
     const md = document.createElement('div');
     md.className = 'ai-md';
-    md.innerHTML = renderMarkdown(m.content || '…', { blockMeta });
+    if (m.toolCalls?.length) {
+      // 正文（如果有）+ 工具调用卡片；正文里若还夹了代码块，禁用其运行按钮避免下标冲突
+      const contentHtml = m.content
+        ? renderMarkdown(m.content, { blockMeta: extractCodeBlocks(m.content).map(() => ({ runnable: false })) })
+        : '';
+      md.innerHTML = contentHtml + renderToolCalls(m.toolCalls, blockMeta);
+    } else {
+      md.innerHTML = renderMarkdown(m.content || '…', { blockMeta });
+    }
     bubble.appendChild(md);
 
     const notes = [];
@@ -358,10 +414,11 @@ export function initAiPanel(IC) {
     const s = currentSession();
     const m = s.messages[msgIndex];
     if (!m || m.role !== 'assistant') return;
-    const block = extractCodeBlocks(m.content)[blockIndex];
-    if (!block) return;
+    const act = actionsOf(m)[blockIndex];
+    if (!act || !act.runnable || !act.code) return;
+    const code = act.code;
 
-    const readOnly = isReadOnlyCode(block.code) && !scanCode(block.code).blocked;
+    const readOnly = isReadOnlyCode(code) && !scanCode(code).blocked;
     // 只读代码不动工作簿，不需要留快照（省内存，也免得给只读操作挂个「回滚」按钮）；
     // 写代码才在执行前存一份 xlsx。第一条写代码之前存，能覆盖整条消息的改动。
     if (!m.snapshotId && !readOnly) {
@@ -379,7 +436,7 @@ export function initAiPanel(IC) {
     const rec = IC.diffRecorder ? IC.diffRecorder() : null;
     let res;
     try {
-      res = await runAiCode(block.code, IC, {
+      res = await runAiCode(code, IC, {
         whitelist: IC_WHITELIST,
         onOp: (name, args) => { try { rec?.record(name, args); } catch { /* ignore */ } },
       });
@@ -415,6 +472,12 @@ export function initAiPanel(IC) {
     setStatus('');
     saveSessions();
     renderMessages();
+
+    // tool 模式：手工把这条消息的工具调用都点完了，就把 tool 结果回传，继续 agent 循环。
+    // （自动执行时 state.busy 为 true，由 send 里的循环负责继续，这里不重复触发）
+    if (!state.busy && state.settings.tools !== false && allToolCallsResolved(m)) {
+      continueAgent().catch((e) => console.error('[AI] 继续 agent 循环失败', e));
+    }
   }
 
   function rollback(snapshotId) {
@@ -435,19 +498,21 @@ export function initAiPanel(IC) {
   }
 
   // ------------------------------------------------------------ sending
-  // 模型常常把一次「找规律/核对数据」拆成好几轮读查询，每轮只发一个只读代码块。
-  // 所以这里做成一个小的 agent 循环：拿到回复 → 自动跑该跑的代码块 → 把执行结果
-  // 作为合成 user 消息回传（见 context.js 的 messagesToApi）→ 继续问，直到模型不再
-  // 发可自动执行的代码，或连续两轮跑的是同一段代码（防止原地打转）。
+  // 模型可能分好几轮：调用工具 → 拿到结果 → 再调用 → … 直到给出最终回答。
+  // 这里做成一个小的 agent 循环，最多 MAX_ROUNDS 轮；连续两轮跑同一段代码则认为原地打转，退出。
   const MAX_ROUNDS = 12;
 
   /** 请求一次模型回复：追加一条 assistant 消息、流式渲染，返回它的消息下标。 */
   async function requestReply() {
     const s = currentSession();
+    const useTools = state.settings.tools !== false;
     const history = messagesToApi(s.messages);
-    const messages = buildMessages({ history, system: SYSTEM_PROMPT });
+    const messages = buildMessages({ history, system: systemPromptFor({ tools: useTools }) });
+    // endpoint 不支持 tools 时退回代码块模式（系统提示词也跟着换）
+    const messagesCode = useTools ? buildMessages({ history, system: systemPromptFor({ tools: false }) }) : null;
 
     const assistant = { id: id('m'), role: 'assistant', content: '', reasoning: '', at: Date.now() };
+    if (useTools) assistant.toolCalls = [];
     s.messages.push(assistant);
     const index = s.messages.length - 1;
     renderMessages();
@@ -459,26 +524,57 @@ export function initAiPanel(IC) {
       if (r.reasoning) assistant.reasoning = r.reasoning;
       if (r.usage) assistant.usage = r.usage;
       if (typeof r.ttftMs === 'number') assistant.ttftMs = r.ttftMs;
+      if (Array.isArray(r.toolCalls) && r.toolCalls.length) assistant.toolCalls = r.toolCalls.map(toStoredToolCall);
     };
-    try {
-      const useStream = state.settings.stream !== false;
+    // 流式期间把已拼出的 tool_calls 实时渲染出来
+    const onToolCall = (calls) => {
+      assistant.toolCalls = (calls || []).map(toStoredToolCall);
+      updateStreamingBubble(index);
+    };
+    const useStream = state.settings.stream !== false;
+    /** 一次尝试：先流式，失败可退回非流式（endpoint 不支持流式时）。 */
+    const tryChat = async (msgs, withTools) => {
+      const base = { signal: state.abort?.signal };
+      if (withTools) { base.tools = TOOLS; base.toolChoice = 'auto'; }
       try {
-        absorb(await provider.chat(messages, {
+        absorb(await provider.chat(msgs, {
+          ...base,
           stream: useStream,
-          signal: state.abort?.signal,
           onDelta: (_d, full) => { assistant.content = full; updateStreamingBubble(index); },
           onReasoning: (_d, full) => { assistant.reasoning = full; updateStreamingBubble(index); },
+          ...(withTools ? { onToolCall } : {}),
         }));
       } catch (e) {
         const authFail = e instanceof ApiError && (e.status === 401 || e.status === 403);
-        if (useStream && !authFail && !assistant.content && !state.abort?.signal.aborted) {
+        const hasAny = !!assistant.content || !!assistant.toolCalls?.length;
+        if (useStream && !authFail && !hasAny && !state.abort?.signal.aborted) {
           // 有些 endpoint 不支持流式，退化成一次性返回再试
-          absorb(await provider.chat(messages, { stream: false, signal: state.abort?.signal }));
+          absorb(await provider.chat(msgs, { ...base, stream: false }));
         } else {
           throw e;
         }
       }
-      if (!assistant.content.trim()) assistant.content = '（模型返回了空内容）';
+    };
+    try {
+      // 先按当前设置试；拿到 4xx「不支持 tools」时退回代码块模式再试一次。
+      const plans = useTools ? [true, false] : [false];
+      for (let pi = 0; pi < plans.length; pi++) {
+        const withTools = plans[pi];
+        try {
+          await tryChat(withTools ? messages : messagesCode, withTools);
+          if (!withTools && useTools) {
+            assistant.toolCalls = [];
+            console.warn('[AI] 该 endpoint 不支持 tools，已退回代码块模式');
+          }
+          break;
+        } catch (e) {
+          const retryable = e instanceof ApiError && [400, 404, 422].includes(e.status);
+          const hasAny = !!assistant.content || !!assistant.toolCalls?.length;
+          if (pi < plans.length - 1 && retryable && !hasAny) continue;
+          throw e;
+        }
+      }
+      if (!assistant.content.trim() && !assistant.toolCalls?.length) assistant.content = '（模型返回了空内容）';
     } catch (e) {
       console.error('[AI] 请求失败', e?.cause ?? e);
       const msg = e instanceof ApiError ? e.message : String(e?.message || e);
@@ -492,21 +588,66 @@ export function initAiPanel(IC) {
     return index;
   }
 
-  /** 自动执行一条回复里该跑的代码块；返回真正跑过的代码签名（没跑返回 ''）。 */
-  async function autoRunBlocks(index, assistant) {
-    const blocks = extractCodeBlocks(assistant.content);
+  /**
+   * 自动执行一条回复里该跑的 action（tool call 或代码块）。
+   * 返回 { signature, pending }：
+   *   - signature: 真正跑过的代码拼接（用于防原地打转）
+   *   - pending: 因为要用户确认而没跑的写操作个数（>0 时循环应停下来等用户）
+   */
+  async function autoRunActions(index, assistant) {
+    const acts = actionsOf(assistant);
     const ran = [];
-    for (let i = 0; i < blocks.length; i++) {
-      if (!blocks[i].runnable) continue;
-      // 只读代码块无需确认（不受「自动执行」开关影响）；写代码块只有开了自动执行才自动跑。
+    let pending = 0;
+    for (let i = 0; i < acts.length; i++) {
+      const a = acts[i];
+      if (!a.runnable || !a.code) continue;
+      // 只读调用无需确认（不受「自动执行」开关影响）；写操作只有开了自动执行才自动跑。
       // 被静态扫描拦下的代码不自动跑，留给用户自己点。
-      const readOnly = isReadOnlyCode(blocks[i].code) && !scanCode(blocks[i].code).blocked;
+      const readOnly = isReadOnlyCode(a.code) && !scanCode(a.code).blocked;
       if (readOnly || state.settings.autoRun) {
         await runBlock(index, i);
-        ran.push(blocks[i].code);
+        ran.push(a.code);
+      } else {
+        pending++;
       }
     }
-    return ran.join('\n---\n');
+    return { signature: ran.join('\n---\n'), pending };
+  }
+
+  /** agent 循环主体：反复请求 + 自动执行，直到模型不再需要工具。 */
+  async function agentLoop() {
+    const s = currentSession();
+    let lastRan = null;
+    for (let round = 0; round < MAX_ROUNDS; round++) {
+      const index = await requestReply();
+      const { signature, pending } = await autoRunActions(index, s.messages[index]);
+      // 还有写操作等用户点「运行」：停下来，别把带占位结果的 tool_calls 发给模型
+      if (pending) break;
+      if (!signature) break;              // 模型给了最终回答（没有可自动执行的调用）
+      if (signature === lastRan) break;   // 又在跑一模一样的代码，避免原地打转
+      lastRan = signature;
+      if (state.abort?.signal.aborted) break;
+      setStatus(`继续第 ${round + 2} 轮…`);
+    }
+  }
+
+  /** 手工点完最后一个工具调用的「运行」后，接着把结果回传，让模型继续。 */
+  async function continueAgent() {
+    if (state.busy) return;
+    state.busy = true;
+    state.abort = new AbortController();
+    setBusy(true);
+    try {
+      await agentLoop();
+    } finally {
+      state.busy = false;
+      state.abort = null;
+      setBusy(false);
+      setStatus('');
+      currentSession().updatedAt = Date.now();
+      saveSessions();
+      renderMessages();
+    }
   }
 
   async function send() {
@@ -543,16 +684,7 @@ export function initAiPanel(IC) {
     state.abort = new AbortController();
     setBusy(true);
     try {
-      let lastRan = null;
-      for (let round = 0; round < MAX_ROUNDS; round++) {
-        const index = await requestReply();
-        const ran = await autoRunBlocks(index, s.messages[index]);
-        if (!ran) break;              // 模型给了最终回答（没有可自动跑的代码）
-        if (ran === lastRan) break;   // 又在跑一模一样的代码，避免原地打转
-        lastRan = ran;
-        if (state.abort?.signal.aborted) break;
-        setStatus(`继续第 ${round + 2} 轮…`);
-      }
+      await agentLoop();
     } finally {
       state.busy = false;
       state.abort = null;
@@ -579,6 +711,7 @@ export function initAiPanel(IC) {
     $('ai-temp').value = c.temperature ?? '';
     $('ai-context').checked = c.context !== false;
     $('ai-stream').checked = c.stream !== false;
+    $('ai-tools').checked = c.tools !== false;
   }
   function readConfigForm() {
     state.settings.baseUrl = $('ai-baseurl').value.trim();
@@ -588,6 +721,7 @@ export function initAiPanel(IC) {
     state.settings.temperature = t === '' ? '' : Number(t);
     state.settings.context = $('ai-context').checked;
     state.settings.stream = $('ai-stream').checked;
+    state.settings.tools = $('ai-tools').checked;
   }
   function applyConfig(save = true) {
     readConfigForm();
@@ -708,6 +842,7 @@ export function initAiPanel(IC) {
   $('ai-del-session-head').onclick = (ev) => armingConfirm(ev.currentTarget, deleteCurrentSession);
   $('ai-autorun').checked = !!state.settings.autoRun;
   $('ai-autorun').onchange = (ev) => { state.settings.autoRun = ev.target.checked; saveSettings(); };
+  $('ai-tools').onchange = (ev) => { state.settings.tools = ev.target.checked; saveSettings(); };
   $('ai-send').onclick = () => send();
   $('ai-stop').onclick = () => { state.abort?.abort(); setStatus('已请求停止…'); };
   $('ai-input').addEventListener('keydown', (ev) => {

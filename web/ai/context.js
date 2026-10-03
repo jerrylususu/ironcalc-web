@@ -91,7 +91,9 @@ export function composeUserContent(text, context = '') {
  *
  * 关键：**只追加、不改写**。
  *   - 用户消息用 `apiContent`（发消息当刻就存好的「快照 + 原文」），没有则退回 content。
- *   - assistant 消息后面追加一条合成的 user 消息，把那次代码执行结果回传给模型；
+ *   - 原生 tool call 的 assistant 消息：保留 `tool_calls`，后面紧跟对应的 role:'tool' 结果消息
+ *     （OpenAI 要求 tool_calls 后必须紧跟它每个 id 的 tool 结果，否则报 400）。
+ *   - 老式代码块模式的 assistant 消息后面追加一条合成的 user 消息，把那次代码执行结果回传。
  *     结果是从 `m.runs` 确定性推导出来的，所以同一段历史每轮拼出来都一样。
  * 这样第 N 轮的消息数组是第 N+1 轮的前缀，服务端的 prefix cache 能命中。
  */
@@ -99,7 +101,31 @@ export function messagesToApi(messages = [], { max = 80 } = {}) {
   const out = [];
   const list = messages.slice(-max);
   for (const m of list) {
-    if (!m || (m.role !== 'user' && m.role !== 'assistant')) continue;
+    if (!m) continue;
+
+    // 原生 tool call：assistant(tool_calls) + tool 结果
+    if (m.role === 'assistant' && Array.isArray(m.toolCalls) && m.toolCalls.length) {
+      out.push({
+        role: 'assistant',
+        content: m.content ?? '',
+        tool_calls: m.toolCalls.map((tc) => ({
+          id: tc.id,
+          type: 'function',
+          function: { name: tc.name, arguments: tc.raw ?? JSON.stringify(tc.args ?? {}) },
+        })),
+      });
+      m.toolCalls.forEach((tc, i) => {
+        const r = m.runs?.[i];
+        out.push({
+          role: 'tool',
+          tool_call_id: tc.id,
+          content: (r && r.text) ? r.text : '（本轮工具调用没有执行）',
+        });
+      });
+      continue;
+    }
+
+    if (m.role !== 'user' && m.role !== 'assistant') continue;
     const content = m.apiContent ?? m.content;
     if (!content) continue;
     out.push({ role: m.role, content });
@@ -124,9 +150,13 @@ export function buildMessages({ history = [], system = '', maxHistory = 80 } = {
   const msgs = [];
   if (system) msgs.push({ role: 'system', content: system });
   for (const m of history.slice(-maxHistory)) {
-    if (!m || !m.content) continue;
+    if (!m) continue;
+    // role:'tool' 的结果消息原样透传
+    if (m.role === 'tool') { msgs.push(m); continue; }
     if (m.role !== 'user' && m.role !== 'assistant') continue;
-    msgs.push({ role: m.role, content: m.content });
+    // assistant 只有 tool_calls、content 为空时也要保留
+    if (!m.content && !(Array.isArray(m.tool_calls) && m.tool_calls.length)) continue;
+    msgs.push(m);
   }
   return msgs;
 }

@@ -88,11 +88,30 @@ function reasoningOf(obj) {
   return typeof v === 'string' ? v : '';
 }
 
+/**
+ * 把各家略有差异的 tool_call 结构归一成 { id, type, name, arguments }：
+ *   - 非流式：{ id, type, function: { name, arguments } }
+ *   - 流式累积时 arguments 是分片拼出来的字符串
+ */
+function normalizeToolCall(tc) {
+  return {
+    id: tc?.id || '',
+    type: tc?.type || 'function',
+    name: tc?.function?.name || tc?.name || '',
+    arguments: tc?.function?.arguments ?? tc?.arguments ?? '',
+  };
+}
+
+function normalizeToolCalls(list) {
+  if (!Array.isArray(list) || !list.length) return [];
+  return list.map(normalizeToolCall).filter((t) => t.name || t.id || t.arguments);
+}
+
 async function readSse(res, opts, signal) {
   if (!res.body || typeof res.body.getReader !== 'function') {
     throw new ApiError('该 endpoint 的流式响应无法读取（没有 response body）', { status: res.status });
   }
-  const { onDelta, onReasoning, startedAt } = opts || {};
+  const { onDelta, onReasoning, onToolCall, startedAt } = opts || {};
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buf = '';
@@ -101,6 +120,10 @@ async function readSse(res, opts, signal) {
   let usage = null;
   let ttftMs = null;
   let finished = false;
+  let finishReason = null;
+  // 流式 tool_calls：按 index 累积分片（name 可能出现一次，arguments 会被切成很多片）
+  const toolAcc = new Map();
+  const snapshotToolCalls = () => normalizeToolCalls([...toolAcc.keys()].sort((a, b) => a - b).map((k) => toolAcc.get(k)));
 
   const markFirst = () => {
     if (ttftMs === null && typeof startedAt === 'number') {
@@ -120,6 +143,7 @@ async function readSse(res, opts, signal) {
     // DeepSeek 把 usage 放在最后一个 chunk 的顶层（需请求里带 stream_options.include_usage）
     if (json?.usage) usage = json.usage;
     const choice = json?.choices?.[0];
+    if (choice?.finish_reason) finishReason = choice.finish_reason;
     const rdelta = reasoningOf(choice?.delta) || reasoningOf(choice?.message);
     const delta = choice?.delta?.content ?? choice?.message?.content;
     if (rdelta) {
@@ -131,6 +155,20 @@ async function readSse(res, opts, signal) {
       content += delta;
       markFirst();
       onDelta?.(delta, content);
+    }
+    const tcs = choice?.delta?.tool_calls ?? choice?.message?.tool_calls;
+    if (Array.isArray(tcs)) {
+      for (const d of tcs) {
+        const idx = Number.isInteger(d?.index) ? d.index : toolAcc.size;
+        let acc = toolAcc.get(idx);
+        if (!acc) { acc = { id: '', type: 'function', function: { name: '', arguments: '' } }; toolAcc.set(idx, acc); }
+        if (d?.id) acc.id = d.id;
+        if (d?.type) acc.type = d.type;
+        if (d?.function?.name) acc.function.name += d.function.name;
+        if (d?.function?.arguments) acc.function.arguments += d.function.arguments;
+        markFirst();
+        onToolCall?.(snapshotToolCalls());
+      }
     }
     return false;
   };
@@ -147,7 +185,7 @@ async function readSse(res, opts, signal) {
       if (handleLine(line)) { finished = true; break; }
     }
   }
-  return { content, reasoning, usage, ttftMs };
+  return { content, reasoning, usage, ttftMs, toolCalls: snapshotToolCalls(), finishReason };
 }
 
 /** 把外部 signal 与超时合成一个 signal，返回 { signal, timedOut, cleanup }。 */
@@ -198,11 +236,13 @@ export function createProvider(config = {}) {
 
   /**
    * 发一句话，拿回复。
-   * opts: { stream, onDelta, onReasoning, signal, model, temperature, messages }
-   * 返回 { content, reasoning, usage, ttftMs, raw, streamed }
+   * opts: { stream, onDelta, onReasoning, onToolCall, tools, toolChoice, signal, model, temperature, messages }
+   * 返回 { content, reasoning, usage, ttftMs, toolCalls, finishReason, raw, streamed }
    *   - reasoning: 推理内容（DeepSeek reasoning_content / 部分兼容实现的 reasoning），没有则 null
    *   - usage: 服务端 token 统计，没有则 null
    *   - ttftMs: 从发请求到第一个 delta 的毫秒数（非流式则为整个响应耗时）
+   *   - toolCalls: 原生工具调用 [{ id, type, name, arguments }]，没有则 []
+   *   - finishReason: 'stop' | 'tool_calls' | 'length' …
    */
   async function chat(messages, opts = {}) {
     const c = readConfig();
@@ -224,6 +264,11 @@ export function createProvider(config = {}) {
     const temperature = opts.temperature ?? c.temperature;
     if (temperature !== undefined && temperature !== null && temperature !== '') {
       body.temperature = Number(temperature);
+    }
+    // 原生 tool / function calling：模型用 run_script 之类的工具来改表，而不是写 js 代码块。
+    if (Array.isArray(opts.tools) && opts.tools.length) {
+      body.tools = opts.tools;
+      if (opts.toolChoice) body.tool_choice = opts.toolChoice;
     }
 
     const link = linkAbort(opts.signal, opts.timeoutMs ?? c.timeoutMs);
@@ -257,7 +302,12 @@ export function createProvider(config = {}) {
         // 流式读取时的超时/取消也要归一成 ApiError
         let out;
         try {
-          out = await readSse(res, { onDelta: opts.onDelta, onReasoning: opts.onReasoning, startedAt }, link.signal);
+          out = await readSse(res, {
+            onDelta: opts.onDelta,
+            onReasoning: opts.onReasoning,
+            onToolCall: opts.onToolCall,
+            startedAt,
+          }, link.signal);
         } catch (e) {
           if (e instanceof ApiError) throw e;
           if (link.isTimeout()) throw new ApiError('请求超时（流式响应中途断了）', { url });
@@ -269,19 +319,24 @@ export function createProvider(config = {}) {
           reasoning: out.reasoning || null,
           usage: out.usage,
           ttftMs: out.ttftMs,
+          toolCalls: out.toolCalls || [],
+          finishReason: out.finishReason ?? null,
           raw: null,
           streamed: true,
         };
       }
 
       const json = await res.json();
-      const message = json?.choices?.[0]?.message ?? {};
+      const choice = json?.choices?.[0];
+      const message = choice?.message ?? {};
       const content = message.content ?? '';
       return {
         content: typeof content === 'string' ? content : String(content ?? ''),
         reasoning: reasoningOf(message) || null,
         usage: json?.usage ?? null,
         ttftMs: nowMs() - startedAt,
+        toolCalls: normalizeToolCalls(message.tool_calls),
+        finishReason: choice?.finish_reason ?? null,
         raw: json,
         streamed: false,
       };
